@@ -113,11 +113,21 @@ def not_found(e): return jsonify({'error': 'Not found.'}), 404
 def server_error(e): return jsonify({'error': 'Internal server error.'}), 500
 
 
-if __name__ == '__main__':
+# Create tables at import time — this runs whether the app is started
+# with `python app.py` (dev) or through gunicorn/Railway (production).
+# Wrapped defensively so a transient DB hiccup on boot doesn't crash-loop
+# the whole container.
+try:
     with app.app_context():
         db.create_all()
-        print('[Earth Observation and Analysis] DB ready.')
-    port = int(os.getenv('PORT', 5050))
+        logging.info('Database tables ready.')
+except Exception as e:
+    logging.error(f'db.create_all() failed on startup: {e}')
+
+
+if __name__ == '__main__':
+    _port_raw = os.getenv('PORT', '5050')
+    port = int(_port_raw) if _port_raw and _port_raw.isdigit() else 5050
     print(f'[Earth Observation and Analysis] Backend running at http://localhost:{port}')
     print(f'[Earth Observation and Analysis] Earth Engine available: {gee_engine.EE_AVAILABLE}')
     app.run(host='0.0.0.0', port=port, debug=os.getenv('FLASK_ENV')=='development')

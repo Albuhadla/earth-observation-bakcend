@@ -11,7 +11,17 @@ from models import db, User
 
 auth_bp = Blueprint('auth', __name__)
 SECRET  = os.getenv('SECRET_KEY', 'change-me-in-production')
-TOKEN_DAYS = int(os.getenv('TOKEN_EXPIRY_DAYS', 30))
+
+def _safe_int(value, default):
+    """Blank/invalid env vars (common when copy-pasting into a
+    dashboard and leaving a field empty) must never crash the app
+    at import time — fall back to the default instead."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+TOKEN_DAYS = _safe_int(os.getenv('TOKEN_EXPIRY_DAYS'), 30)
 
 
 def token_required(f):

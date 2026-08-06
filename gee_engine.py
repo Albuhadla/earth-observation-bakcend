@@ -14,9 +14,13 @@ try:
     import ee
     EE_AVAILABLE = True
     _initialized = False
-except ImportError:
+except Exception as _ee_import_err:
+    # Catch ANY failure here, not just ImportError — version conflicts,
+    # missing system libs, etc. on the host can raise other exception
+    # types, and letting those escape crashes the whole app on every boot.
     EE_AVAILABLE = False
     _initialized = False
+    logger.warning(f'earthengine-api unavailable, running in simulation mode: {_ee_import_err}')
 
 
 def init_ee():

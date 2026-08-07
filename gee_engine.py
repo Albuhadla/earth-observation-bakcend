@@ -53,6 +53,69 @@ RANGES = {
     'reeds':(0,0.8), 'riparian':(0.5,4), 'halophyte':(0.5,4), 'scrub':(0.05,0.35), 'mud':(0.3,3), 'sav':(-0.2,0.5),
 }
 
+# Palettes — mirror app.js's FAMILIES[*].items[*].palette exactly, so the
+# real GEE-rendered thumbnail uses the identical colour ramp the frontend
+# legend shows.
+PALETTES = {
+    'NDTI':      ['081d58','225ea8','41b6c4','c7e9b4','ffffcc','fdae61','d73027'],
+    'NDCI':      ['440154','414487','2a788e','22a884','7ad151','fde725'],
+    'TSS':       ['313695','74add1','ffffbf','fdae61','a50026'],
+    'NDWI':      ['d7191c','fdae61','ffffbf','abd9e9','2c7bb6'],
+    'SABI':      ['00429d','73a2c6','d3eacd','f4777f','93003a'],
+    'FAI':       ['08306b','6baed6','ffffcc','fd8d3c','e31a1c'],
+    'Secchi':    ['a50026','fdae61','abd9e9','313695'],
+    'ndvi':      ['d73027','fee08b','ffffbf','66bd63','1a9850'],
+    'mndwi':     ['8b4513','f5deb3','a8ddb5','084081'],
+    'ndbi':      ['313695','abd9e9','fdae61','a50026'],
+    'iron':      ['ffffff','f4a460','8b4513','5c1a00'],
+    'clay':      ['ffffff','a8d5a2','2d6e2a','0d3d0a'],
+    'carbonate': ['ffffff','b0b0dd','404099','101077'],
+    'evaporite': ['1a3a5c','5ba4cf','deebf7','ffffff'],
+    'allmin':    ['313695','74add1','ffffbf','f46d43','a50026'],
+    'reeds':     ['ffffff','80c080','105510'],
+    'riparian':  ['ffffff','c0e080','1a4000'],
+    'halophyte': ['ffffff','e8c880','402000'],
+    'scrub':     ['ffffff','d4c870','303000'],
+    'mud':       ['004080','80b8d0','ffffff'],
+    'sav':       ['002040','0060a0','80d0f0'],
+}
+
+# True/false-colour Landsat combos have no single "value" band — these show
+# the actual composite bands directly instead of a palette ramp.
+RGB_VIS = {
+    'natural':  {'bands':['SR_B4','SR_B3','SR_B2'], 'min':0, 'max':0.3, 'gamma':1.2},
+    'falseveg': {'bands':['SR_B5','SR_B4','SR_B3'], 'min':0, 'max':0.4},
+    'urban':    {'bands':['SR_B7','SR_B6','SR_B4'], 'min':0, 'max':0.4},
+    'agri':     {'bands':['SR_B6','SR_B5','SR_B2'], 'min':0, 'max':0.4},
+}
+
+
+def safe_thumb_url(index_v, roi, img=None, composite=None):
+    """
+    Generate a real, GEE-rendered PNG of the actual computed layer,
+    clipped to the drawn ROI — this is what makes the frontend show
+    real satellite-derived pixels instead of a stylised placeholder.
+    Returns None on any failure so a thumbnail issue never breaks
+    the numeric reading itself.
+    """
+    try:
+        if index_v in RGB_VIS and composite is not None:
+            vis = RGB_VIS[index_v]
+            return composite.clip(roi).getThumbURL({
+                'region': roi, 'dimensions': 420, 'format': 'png', **vis
+            })
+        if img is not None:
+            lo, hi = RANGES.get(index_v, (0, 1))
+            palette = PALETTES.get(index_v, ['0a3040', '0e5468', '00c2d1'])
+            return img.select('value').clip(roi).getThumbURL({
+                'region': roi, 'dimensions': 420, 'format': 'png',
+                'min': lo, 'max': hi, 'palette': palette
+            })
+    except Exception as e:
+        logger.warning(f'Thumbnail generation failed for {index_v}: {e}')
+    return None
+
+
 
 def mask_s2(image):
     scl = image.select('SCL')
@@ -213,13 +276,19 @@ def run_reading(family, index_v, start_date, end_date, coords):
         if mean is None:
             return {'error': 'No valid pixels inside the drawn region for this index.'}
 
+        # Real GEE-rendered thumbnail of the actual computed layer,
+        # clipped to the exact ROI — shown on the frontend map/panel
+        # instead of a synthetic placeholder.
+        thumb_url = safe_thumb_url(index_v, roi, img=img, composite=composite)
+
         return {
             'mean': round(mean, 4),
             'min':  round(stats.get('value_min', mean), 4),
             'max':  round(stats.get('value_max', mean), 4),
             'std':  round(stats.get('value_stdDev', 0) or 0, 4),
             'images': count,
-            'source': 'gee_live'
+            'source': 'gee_live',
+            'thumb_url': thumb_url
         }
     except Exception as e:
         logger.error(f'GEE reading error: {e}')

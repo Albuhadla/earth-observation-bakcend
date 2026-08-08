@@ -51,7 +51,16 @@ def subscription_required(f):
 
 @app.route('/api/health')
 def health():
-    return jsonify({'status': 'ok', 'gee_available': gee_engine.EE_AVAILABLE})
+    # Actually attempt initialisation here (not just check the package
+    # imported) so this endpoint tells the truth about whether real GEE
+    # calls will work, with the real error if not.
+    ee_ready = gee_engine.EE_AVAILABLE and gee_engine.init_ee()
+    return jsonify({
+        'status': 'ok',
+        'gee_package_installed': gee_engine.EE_AVAILABLE,
+        'gee_available': ee_ready,
+        'gee_init_error': gee_engine._last_ee_init_error if not ee_ready else None
+    })
 
 
 @app.route('/api/analysis/run', methods=['POST'])

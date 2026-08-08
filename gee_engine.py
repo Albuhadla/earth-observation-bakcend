@@ -14,17 +14,19 @@ try:
     import ee
     EE_AVAILABLE = True
     _initialized = False
+    _last_ee_init_error = None
 except Exception as _ee_import_err:
     # Catch ANY failure here, not just ImportError — version conflicts,
     # missing system libs, etc. on the host can raise other exception
     # types, and letting those escape crashes the whole app on every boot.
     EE_AVAILABLE = False
     _initialized = False
+    _last_ee_init_error = str(_ee_import_err)
     logger.warning(f'earthengine-api unavailable, running in simulation mode: {_ee_import_err}')
 
 
 def init_ee():
-    global _initialized
+    global _initialized, _last_ee_init_error
     if _initialized or not EE_AVAILABLE:
         return EE_AVAILABLE
     try:
@@ -53,6 +55,7 @@ def init_ee():
         logger.info('Earth Engine initialised.')
         return True
     except Exception as e:
+        _last_ee_init_error = str(e)
         logger.error(f'EE init failed: {e}')
         return False
 
@@ -231,8 +234,12 @@ def vegetation_image(s2, index_v):
 
 def run_reading(family, index_v, start_date, end_date, coords):
     """Returns dict with mean/min/max/std/images or {'error': ...}"""
-    if not (EE_AVAILABLE and init_ee()):
-        return simulate(family, index_v, start_date, end_date)
+    if not EE_AVAILABLE:
+        return simulate(family, index_v, start_date, end_date,
+                         real_error='earthengine-api package not installed on the server')
+    if not init_ee():
+        return simulate(family, index_v, start_date, end_date,
+                         real_error=_last_ee_init_error or 'Earth Engine initialisation failed (see server logs)')
 
     try:
         roi = roi_from_coords(coords)
@@ -305,7 +312,7 @@ def run_reading(family, index_v, start_date, end_date, coords):
         }
     except Exception as e:
         logger.error(f'GEE reading error: {e}')
-        return simulate(family, index_v, start_date, end_date)
+        return simulate(family, index_v, start_date, end_date, real_error=str(e))
 
 
 def run_timeseries(family, index_v, start_date, end_date, coords):
@@ -356,17 +363,23 @@ def _seed(*parts):
     h = hashlib.md5('|'.join(parts).encode()).hexdigest()
     return int(h[:8], 16)
 
-def simulate(family, index_v, start_date, end_date):
+def simulate(family, index_v, start_date, end_date, real_error=None):
     rng = random.Random(_seed(family, index_v, start_date, end_date))
     lo, hi = RANGES.get(index_v, (0, 1))
     span = hi - lo
     mean = lo + span * (0.35 + rng.random()*0.3)
     std  = span * 0.08 * (0.6 + rng.random()*0.8)
+    # Surface the REAL underlying error when we have one, instead of a
+    # generic message — this is what makes the actual cause visible in
+    # the browser's Network tab without needing to dig through server logs.
+    note = (f'GEE call failed, showing simulated data. Real error: {real_error}'
+            if real_error else
+            'GEE credentials not configured on the server — showing simulated data.')
     return {
         'mean': round(mean,4), 'std': round(std,4),
         'min': round(max(lo, mean-std*2.2),4), 'max': round(min(hi, mean+std*2.2),4),
         'images': 18 + rng.randint(0,55), 'source': 'simulated',
-        'note': 'GEE credentials not configured on the server — showing simulated data.'
+        'note': note
     }
 
 def simulate_timeseries(index_v, start_date, end_date):

@@ -34,16 +34,27 @@ def init_ee():
         project = os.getenv('GEE_PROJECT', '')
 
         # Preferred for hosted deployments (Railway, Render, etc.) with a
-        # PUBLIC repo: paste the entire key JSON content into a Railway
-        # variable called GEE_KEY_JSON. Nothing sensitive ever touches
-        # GitHub this way.
+        # PUBLIC repo: base64-encode the entire key JSON file and paste
+        # that into a Railway variable called GEE_KEY_JSON_B64. This is
+        # far more reliable than pasting raw JSON, since copy/pasting a
+        # multi-line private key into a text box often corrupts its
+        # internal line breaks (a very common "MalformedFraming" error).
+        key_json_b64 = os.getenv('GEE_KEY_JSON_B64')
+
+        # Older/plain option: paste the raw JSON directly. Kept for
+        # compatibility, but prefer the base64 variable above.
         key_json = os.getenv('GEE_KEY_JSON')
 
         # Fallback for local development: a gee_key.json file sitting
         # next to this script (never commit this file — see .gitignore).
         key_file = os.getenv('GEE_KEY_FILE', 'gee_key.json')
 
-        if service_account and key_json:
+        if service_account and key_json_b64:
+            import base64
+            decoded = base64.b64decode(key_json_b64).decode('utf-8')
+            creds = ee.ServiceAccountCredentials(service_account, key_data=decoded)
+            ee.Initialize(creds, project=project)
+        elif service_account and key_json:
             creds = ee.ServiceAccountCredentials(service_account, key_data=key_json)
             ee.Initialize(creds, project=project)
         elif service_account and os.path.exists(key_file):

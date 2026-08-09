@@ -78,6 +78,8 @@ RANGES = {
     'ndvi':(-0.2,0.8), 'mndwi':(-0.5,0.5), 'ndbi':(-0.5,0.3),
     'iron':(0.8,3), 'clay':(0.8,2.5), 'carbonate':(0.5,2), 'evaporite':(0,0.5), 'allmin':(0.8,2.5),
     'reeds':(0,0.8), 'riparian':(0.5,4), 'halophyte':(0.5,4), 'scrub':(0.05,0.35), 'mud':(0.3,3), 'sav':(-0.2,0.5),
+    'nightlights': (0, 40),  # radiance, nW/cm2/sr — urban cores often 20-60+
+    'ubndbi':      (-0.5, 0.3),  # same NDBI math, exposed under the Urban family too
 }
 
 # Palettes — mirror app.js's FAMILIES[*].items[*].palette exactly, so the
@@ -105,6 +107,8 @@ PALETTES = {
     'scrub':     ['ffffff','d4c870','303000'],
     'mud':       ['004080','80b8d0','ffffff'],
     'sav':       ['002040','0060a0','80d0f0'],
+    'nightlights': ['000000','1a0033','4d0080','b30086','ff8c00','ffeb3b','ffffff'],
+    'ubndbi':    ['313695','abd9e9','fdae61','a50026'],
 }
 
 # True/false-colour Landsat combos have no single "value" band — these show
@@ -114,6 +118,9 @@ RGB_VIS = {
     'falseveg': {'bands':['SR_B5','SR_B4','SR_B3'], 'min':0, 'max':0.4},
     'urban':    {'bands':['SR_B7','SR_B6','SR_B4'], 'min':0, 'max':0.4},
     'agri':     {'bands':['SR_B6','SR_B5','SR_B2'], 'min':0, 'max':0.4},
+    # Sentinel-2 true colour — 10m native resolution vs Landsat's 30m,
+    # roughly 3x sharper for spotting individual streets/buildings.
+    's2rgb':    {'bands':['B4','B3','B2'], 'min':0, 'max':0.3, 'gamma':1.2},
 }
 
 
@@ -129,13 +136,13 @@ def safe_thumb_url(index_v, roi, img=None, composite=None):
         if index_v in RGB_VIS and composite is not None:
             vis = RGB_VIS[index_v]
             return composite.clip(roi).getThumbURL({
-                'region': roi, 'dimensions': 420, 'format': 'png', **vis
+                'region': roi, 'dimensions': 768, 'format': 'png', **vis
             })
         if img is not None:
             lo, hi = RANGES.get(index_v, (0, 1))
             palette = PALETTES.get(index_v, ['0a3040', '0e5468', '00c2d1'])
             return img.select('value').clip(roi).getThumbURL({
-                'region': roi, 'dimensions': 420, 'format': 'png',
+                'region': roi, 'dimensions': 768, 'format': 'png',
                 'min': lo, 'max': hi, 'palette': palette
             })
     except Exception as e:
@@ -294,6 +301,46 @@ def run_reading(family, index_v, start_date, end_date, coords):
             composite = coll.map(mask_s2).median().clip(roi)
             img = vegetation_image(composite, index_v)
             scale = 10
+
+        elif family == 'urban':
+            if index_v == 'nightlights':
+                # VIIRS monthly nighttime lights — global, no cloud masking needed.
+                # City growth shows up directly as brightening over time.
+                coll = (ee.ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG')
+                        .filterBounds(roi).filterDate(start_date, end_date))
+                count = coll.size().getInfo()
+                if count == 0:
+                    return {'error': 'No VIIRS nighttime lights data for this period/region (data starts April 2012).'}
+                composite = coll.select('avg_rad').median().clip(roi)
+                img = composite.max(0).rename('value')  # clip stray negative radiance noise
+                scale = 500  # VIIRS native resolution is ~500m
+
+            elif index_v == 's2rgb':
+                # Sentinel-2 true colour — 10m resolution, ~3x sharper than
+                # Landsat 9's 30m, best option for spotting individual
+                # streets/buildings/new construction by eye.
+                # Filter aligned to 40% (same as every other Sentinel-2
+                # branch) — this used to be a stricter 20%, which made the
+                # "Original imagery" companion photo fail far more often
+                # than the main analysis it's paired with.
+                coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                        .filterBounds(roi).filterDate(start_date, end_date)
+                        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+                count = coll.size().getInfo()
+                if count == 0: return {'error': 'No Sentinel-2 images for this period/region.'}
+                composite = coll.map(mask_s2).median().clip(roi)
+                img = composite.normalizedDifference(['B8','B4']).rename('value')  # NDVI as stat proxy only
+                scale = 10
+
+            else:  # 'ubndbi' — built-up index, same math as Landsat NDBI
+                coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+                        .filterBounds(roi).filterDate(start_date, end_date)
+                        .filter(ee.Filter.lt('CLOUD_COVER', 30)))
+                count = coll.size().getInfo()
+                if count == 0: return {'error': 'No Landsat 9 images for this period/region (launched Sep 2021).'}
+                composite = coll.map(mask_l9).median().clip(roi)
+                img = composite.normalizedDifference(['SR_B6','SR_B5']).rename('value')
+                scale = 30
         else:
             return {'error': f'Unknown family: {family}'}
 
@@ -331,9 +378,25 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
         return simulate_timeseries(index_v, start_date, end_date)
     try:
         roi = roi_from_coords(coords)
-        coll_id = 'COPERNICUS/S2_SR_HARMONIZED' if family in ('water','veg') else 'LANDSAT/LC09/C02/T1_L2'
+
+        # Urban family spans three completely different collections
+        # depending on which index was picked.
+        if family == 'urban':
+            if index_v == 'nightlights':
+                coll_id = 'NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG'
+            elif index_v == 's2rgb':
+                coll_id = 'COPERNICUS/S2_SR_HARMONIZED'
+            else:
+                coll_id = 'LANDSAT/LC09/C02/T1_L2'
+        else:
+            coll_id = 'COPERNICUS/S2_SR_HARMONIZED' if family in ('water','veg') else 'LANDSAT/LC09/C02/T1_L2'
+
         coll = ee.ImageCollection(coll_id).filterBounds(roi).filterDate(start_date, end_date)
-        coll = coll.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)) if 'S2' in coll_id else coll.filter(ee.Filter.lt('CLOUD_COVER', 30))
+        if 'S2' in coll_id:
+            coll = coll.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+        elif 'LANDSAT' in coll_id:
+            coll = coll.filter(ee.Filter.lt('CLOUD_COVER', 30))
+        # VIIRS needs no cloud filter — it's a pre-composited monthly product
 
         start = ee.Date(start_date); end = ee.Date(end_date)
         n_months = end.difference(start, 'month').round()
@@ -342,17 +405,27 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
             n = ee.Number(n)
             m0 = start.advance(n, 'month'); m1 = m0.advance(1, 'month')
             imgs = coll.filterDate(m0, m1)
-            masked = imgs.map(mask_s2 if 'S2' in coll_id else mask_l9)
-            composite = masked.median()
-            if family == 'water':
-                idx = water_index_image(composite, index_v)
-            elif family == 'landsat':
-                idx = landsat_combo_image(composite, index_v)
-            elif family == 'geo':
-                idx = geology_image(composite, index_v)
+
+            if family == 'urban' and index_v == 'nightlights':
+                idx = imgs.select('avg_rad').median().max(0).rename('value')
             else:
-                idx = vegetation_image(composite, index_v)
-            val = idx.select('value').reduceRegion(ee.Reducer.mean(), roi, 100, bestEffort=True).get('value')
+                masked = imgs.map(mask_s2 if 'S2' in coll_id else mask_l9)
+                composite = masked.median()
+                if family == 'water':
+                    idx = water_index_image(composite, index_v)
+                elif family == 'landsat':
+                    idx = landsat_combo_image(composite, index_v)
+                elif family == 'geo':
+                    idx = geology_image(composite, index_v)
+                elif family == 'veg':
+                    idx = vegetation_image(composite, index_v)
+                elif family == 'urban' and index_v == 's2rgb':
+                    idx = composite.normalizedDifference(['B8','B4']).rename('value')
+                else:  # urban / ubndbi
+                    idx = composite.normalizedDifference(['SR_B6','SR_B5']).rename('value')
+
+            scale = 500 if (family=='urban' and index_v=='nightlights') else 100
+            val = idx.select('value').reduceRegion(ee.Reducer.mean(), roi, scale, bestEffort=True).get('value')
             return ee.Feature(None, {'m': m0.format('YYYY-MM'), 'v': val})
 
         fc = ee.FeatureCollection(ee.List.sequence(0, n_months.subtract(1)).map(month_val))

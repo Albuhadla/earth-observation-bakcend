@@ -6,7 +6,7 @@ Python port of the index math from the GEE JavaScript app
 simulation if the `earthengine-api` package or credentials
 are not available, so the API always returns something.
 """
-import os, hashlib, random, logging
+import os, hashlib, random, logging, math
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +124,44 @@ RGB_VIS = {
 }
 
 
+# Native ground resolution (metres/pixel) for every index — used to size
+# thumbnails dynamically so a large ROI doesn't get squeezed into the same
+# fixed pixel count as a small one (which is what caused blocky/low-res
+# results on bigger regions).
+NATIVE_SCALE = {
+    'NDTI':10, 'NDCI':10, 'TSS':10, 'NDWI':10, 'SABI':10, 'FAI':10, 'Secchi':10,
+    'ndvi':30, 'mndwi':30, 'ndbi':30,
+    'iron':30, 'clay':30, 'carbonate':30, 'evaporite':30, 'allmin':30,
+    'reeds':10, 'riparian':10, 'halophyte':10, 'scrub':10, 'mud':10, 'sav':10,
+    'nightlights':500, 's2rgb':10, 'ubndbi':30,
+    'natural':30, 'falseveg':30, 'urban':30, 'agri':30,
+}
+
+
+def compute_optimal_dimensions(roi, native_scale, min_dim=350, max_dim=1024):
+    """
+    Pick a thumbnail pixel size that roughly matches the sensor's real
+    ground resolution across the drawn ROI, instead of always using the
+    same fixed size — which blurs large regions and wastes detail on
+    small ones. Capped both ways: never too small to be useless, never
+    so large it makes the request slow or hits Earth Engine's limits.
+    """
+    try:
+        coords = roi.bounds().coordinates().get(0).getInfo()
+        lons = [c[0] for c in coords]
+        lats = [c[1] for c in coords]
+        mid_lat = sum(lats) / len(lats)
+        m_per_deg_lat = 111320
+        m_per_deg_lon = 111320 * math.cos(math.radians(mid_lat))
+        width_m  = (max(lons) - min(lons)) * m_per_deg_lon
+        height_m = (max(lats) - min(lats)) * m_per_deg_lat
+        px = max(width_m, height_m) / native_scale
+        return int(max(min_dim, min(max_dim, px)))
+    except Exception as e:
+        logger.warning(f'Dimension calc failed, using default: {e}')
+        return 640
+
+
 def safe_thumb_url(index_v, roi, img=None, composite=None):
     """
     Generate a real, GEE-rendered PNG of the actual computed layer,
@@ -132,17 +170,19 @@ def safe_thumb_url(index_v, roi, img=None, composite=None):
     Returns None on any failure so a thumbnail issue never breaks
     the numeric reading itself.
     """
+    native_scale = NATIVE_SCALE.get(index_v, 30)
+    dims = compute_optimal_dimensions(roi, native_scale)
     try:
         if index_v in RGB_VIS and composite is not None:
             vis = RGB_VIS[index_v]
             return composite.clip(roi).getThumbURL({
-                'region': roi, 'dimensions': 768, 'format': 'png', **vis
+                'region': roi, 'dimensions': dims, 'format': 'png', **vis
             })
         if img is not None:
             lo, hi = RANGES.get(index_v, (0, 1))
             palette = PALETTES.get(index_v, ['0a3040', '0e5468', '00c2d1'])
             return img.select('value').clip(roi).getThumbURL({
-                'region': roi, 'dimensions': 768, 'format': 'png',
+                'region': roi, 'dimensions': dims, 'format': 'png',
                 'min': lo, 'max': hi, 'palette': palette
             })
     except Exception as e:

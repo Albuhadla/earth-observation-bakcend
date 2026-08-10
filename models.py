@@ -41,6 +41,24 @@ class User(db.Model):
         }
 
 
+class ReadingCache(db.Model):
+    """
+    Caches finished GEE results (stats + thumbnail URL) keyed by the
+    exact family/index/dates/ROI combination. If two users (or the same
+    user twice) request an identical reading, the second one returns
+    instantly instead of re-running the full Earth Engine computation —
+    this is the single biggest performance/cost win available, since
+    every GEE call has real latency and counts against usage quota.
+    """
+    __tablename__ = 'reading_cache'
+
+    id          = db.Column(db.Integer, primary_key=True)
+    cache_key   = db.Column(db.String(64), unique=True, nullable=False, index=True)
+    result_json = db.Column(db.Text, nullable=False)
+    created_at  = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at  = db.Column(db.DateTime, nullable=False, index=True)
+
+
 class Reading(db.Model):
     """One saved analysis result — the sounding log entry."""
     __tablename__ = 'readings'

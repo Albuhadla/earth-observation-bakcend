@@ -80,6 +80,9 @@ RANGES = {
     'reeds':(0,0.8), 'riparian':(0.5,4), 'halophyte':(0.5,4), 'scrub':(0.05,0.35), 'mud':(0.3,3), 'sav':(-0.2,0.5),
     'nightlights': (0, 40),  # radiance, nW/cm2/sr — urban cores often 20-60+
     'ubndbi':      (-0.5, 0.3),  # same NDBI math, exposed under the Urban family too
+    'slope':       (0, 45),      # degrees — most tell/mound/ditch edges fall in this range
+    'vegAnomaly':  (-0.15, 0.15),# NDVI deviation from local neighbourhood average
+    'sar':         (-25, 0),     # Sentinel-1 VV backscatter, dB
 }
 
 # Palettes — mirror app.js's FAMILIES[*].items[*].palette exactly, so the
@@ -109,6 +112,9 @@ PALETTES = {
     'sav':       ['002040','0060a0','80d0f0'],
     'nightlights': ['000000','1a0033','4d0080','b30086','ff8c00','ffeb3b','ffffff'],
     'ubndbi':    ['313695','abd9e9','fdae61','a50026'],
+    'slope':     ['1a9850','a6d96a','fee08b','fc8d59','d73027'],
+    'vegAnomaly':['8c510a','d8b365','f5f5f5','5ab4ac','01665e'],
+    'sar':       ['000000','404040','808080','c0c0c0','ffffff'],
 }
 
 # True/false-colour Landsat combos have no single "value" band — these show
@@ -135,6 +141,7 @@ NATIVE_SCALE = {
     'reeds':10, 'riparian':10, 'halophyte':10, 'scrub':10, 'mud':10, 'sav':10,
     'nightlights':500, 's2rgb':10, 'ubndbi':30,
     'natural':30, 'falseveg':30, 'urban':30, 'agri':30,
+    'elevation':30, 'slope':30, 'vegAnomaly':10, 'sar':10,
 }
 
 
@@ -173,6 +180,16 @@ def safe_thumb_url(index_v, roi, img=None, composite=None):
     native_scale = NATIVE_SCALE.get(index_v, 30)
     dims = compute_optimal_dimensions(roi, native_scale)
     try:
+        if index_v == 'elevation' and composite is not None:
+            # Raised-relief hillshade — reveals subtle mounds/depressions
+            # that raw elevation colouring would hide, since absolute
+            # elevation varies wildly by region but relief shading is
+            # self-normalising (always renders 0-255 regardless of the
+            # actual metres involved).
+            hillshade = ee.Terrain.hillshade(composite, 315, 45)  # standard NW light, 45° sun angle
+            return hillshade.clip(roi).getThumbURL({
+                'region': roi, 'dimensions': dims, 'format': 'png', 'min': 0, 'max': 255
+            })
         if index_v in RGB_VIS and composite is not None:
             vis = RGB_VIS[index_v]
             return composite.clip(roi).getThumbURL({
@@ -381,6 +398,53 @@ def run_reading(family, index_v, start_date, end_date, coords):
                 composite = coll.map(mask_l9).median().clip(roi)
                 img = composite.normalizedDifference(['SR_B6','SR_B5']).rename('value')
                 scale = 30
+
+        elif family == 'archaeology':
+            if index_v == 'elevation':
+                # Copernicus GLO-30 — free global 30m DEM. Static dataset,
+                # not date-dependent, so "count" is a placeholder (there's
+                # no revisit/cloud filtering concept for elevation data).
+                dem = ee.Image('COPERNICUS/DEM/GLO30').select('DEM').clip(roi)
+                composite = dem  # used by safe_thumb_url for hillshade rendering
+                img = dem.rename('value')  # stats report real elevation in metres
+                count = 1
+                scale = 30
+
+            elif index_v == 'slope':
+                dem = ee.Image('COPERNICUS/DEM/GLO30').select('DEM').clip(roi)
+                composite = dem
+                img = ee.Terrain.slope(dem).rename('value')  # degrees
+                count = 1
+                scale = 30
+
+            elif index_v == 'vegAnomaly':
+                # The classic "crop mark" technique — buried walls stress
+                # vegetation above them (locally lower NDVI than the
+                # surrounding area), buried ditches/canals hold moisture
+                # better (locally higher NDVI). Subtracting a smoothed
+                # local average turns raw NDVI into an anomaly map that
+                # highlights these deviations instead of overall greenness.
+                coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                        .filterBounds(roi).filterDate(start_date, end_date)
+                        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+                count = coll.size().getInfo()
+                if count == 0: return {'error': 'No Sentinel-2 images for this period/region.'}
+                composite = coll.map(mask_s2).median().clip(roi)
+                ndvi = composite.normalizedDifference(['B8', 'B4'])
+                local_avg = ndvi.focalMean(radius=30, units='meters')
+                img = ndvi.subtract(local_avg).rename('value')
+                scale = 10
+
+            else:  # 'sar' — Sentinel-1 radar, can reveal buried features under dry soil/sand
+                coll = (ee.ImageCollection('COPERNICUS/S1_GRD')
+                        .filterBounds(roi).filterDate(start_date, end_date)
+                        .filter(ee.Filter.eq('instrumentMode', 'IW'))
+                        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV')))
+                count = coll.size().getInfo()
+                if count == 0: return {'error': 'No Sentinel-1 SAR images for this period/region.'}
+                composite = coll.select('VV').median().clip(roi)
+                img = composite.rename('value')
+                scale = 10
         else:
             return {'error': f'Unknown family: {family}'}
 
@@ -414,13 +478,20 @@ def run_reading(family, index_v, start_date, end_date, coords):
 
 
 def run_timeseries(family, index_v, start_date, end_date, coords):
+    # Elevation/slope are static terrain data, not a time series — a
+    # monthly trend chart doesn't apply to them the way it does to an
+    # actual satellite index. Fail clearly rather than returning a
+    # meaningless flat line.
+    if family == 'archaeology' and index_v in ('elevation', 'slope'):
+        return {'error': 'Elevation and slope are static terrain data — trend charts apply to time-varying indices like vegetation anomaly or SAR instead.'}
+
     if not (EE_AVAILABLE and init_ee()):
         return simulate_timeseries(index_v, start_date, end_date)
     try:
         roi = roi_from_coords(coords)
 
-        # Urban family spans three completely different collections
-        # depending on which index was picked.
+        # Urban and archaeology families span multiple different
+        # collections depending on which index was picked.
         if family == 'urban':
             if index_v == 'nightlights':
                 coll_id = 'NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG'
@@ -428,11 +499,16 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
                 coll_id = 'COPERNICUS/S2_SR_HARMONIZED'
             else:
                 coll_id = 'LANDSAT/LC09/C02/T1_L2'
+        elif family == 'archaeology':
+            coll_id = 'COPERNICUS/S1_GRD' if index_v == 'sar' else 'COPERNICUS/S2_SR_HARMONIZED'
         else:
             coll_id = 'COPERNICUS/S2_SR_HARMONIZED' if family in ('water','veg') else 'LANDSAT/LC09/C02/T1_L2'
 
         coll = ee.ImageCollection(coll_id).filterBounds(roi).filterDate(start_date, end_date)
-        if 'S2' in coll_id:
+        if coll_id == 'COPERNICUS/S1_GRD':
+            coll = (coll.filter(ee.Filter.eq('instrumentMode', 'IW'))
+                        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV')))
+        elif 'S2' in coll_id:
             coll = coll.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
         elif 'LANDSAT' in coll_id:
             coll = coll.filter(ee.Filter.lt('CLOUD_COVER', 30))
@@ -448,6 +524,12 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
 
             if family == 'urban' and index_v == 'nightlights':
                 idx = imgs.select('avg_rad').median().max(0).rename('value')
+            elif family == 'archaeology' and index_v == 'sar':
+                idx = imgs.select('VV').median().rename('value')
+            elif family == 'archaeology' and index_v == 'vegAnomaly':
+                composite = imgs.map(mask_s2).median()
+                ndvi = composite.normalizedDifference(['B8','B4'])
+                idx = ndvi.subtract(ndvi.focalMean(radius=30, units='meters')).rename('value')
             else:
                 masked = imgs.map(mask_s2 if 'S2' in coll_id else mask_l9)
                 composite = masked.median()

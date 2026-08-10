@@ -401,17 +401,19 @@ def run_reading(family, index_v, start_date, end_date, coords):
 
         elif family == 'archaeology':
             if index_v == 'elevation':
-                # Copernicus GLO-30 — free global 30m DEM. Static dataset,
-                # not date-dependent, so "count" is a placeholder (there's
-                # no revisit/cloud filtering concept for elevation data).
-                dem = ee.Image('COPERNICUS/DEM/GLO30').select('DEM').clip(roi)
+                # Copernicus GLO-30 — free global 30m DEM. It's registered
+                # in Earth Engine's catalog as a tiled ImageCollection, not
+                # a single Image, so it needs mosaicking into one
+                # continuous surface before use. Static dataset, not
+                # date-dependent, so "count" is a placeholder.
+                dem = ee.ImageCollection('COPERNICUS/DEM/GLO30').select('DEM').mosaic().clip(roi)
                 composite = dem  # used by safe_thumb_url for hillshade rendering
                 img = dem.rename('value')  # stats report real elevation in metres
                 count = 1
                 scale = 30
 
             elif index_v == 'slope':
-                dem = ee.Image('COPERNICUS/DEM/GLO30').select('DEM').clip(roi)
+                dem = ee.ImageCollection('COPERNICUS/DEM/GLO30').select('DEM').mosaic().clip(roi)
                 composite = dem
                 img = ee.Terrain.slope(dem).rename('value')  # degrees
                 count = 1

@@ -21,17 +21,72 @@ from models import db, User, Reading
 from auth import auth_bp, token_required
 from payments import payments_bp
 import gee_engine
+import cache as result_cache
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── Error monitoring (Sentry) ───────────────────────────────────
+# Optional — only activates if SENTRY_DSN is set. Without it, the app
+# runs exactly as before; this never blocks startup if the package or
+# DSN is missing.
+SENTRY_DSN = os.getenv('SENTRY_DSN')
+if SENTRY_DSN:
+    try:
+        import sentry_sdk
+        from sentry_sdk.integrations.flask import FlaskIntegration
+        sentry_sdk.init(
+            dsn=SENTRY_DSN,
+            integrations=[FlaskIntegration()],
+            traces_sample_rate=0.2,   # 20% of requests traced for performance data
+            environment=os.getenv('FLASK_ENV', 'production'),
+        )
+        logger.info('Sentry error monitoring active.')
+    except Exception as e:
+        logger.warning(f'Sentry init failed (continuing without it): {e}')
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-me-in-production')
 app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///razaza.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+# Connection pool tuning — matters once on PostgreSQL with real concurrent
+# traffic; harmless no-ops on SQLite. pool_pre_ping avoids the classic
+# "server closed the connection unexpectedly" error after idle periods.
+app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
+    'pool_pre_ping': True,
+    'pool_recycle': 280,
+}
 
-CORS(app, origins=os.getenv('ALLOWED_ORIGINS', '*').split(','))
+_allowed_origins_raw = os.getenv('ALLOWED_ORIGINS', '*')
+_allowed_origins = [o.strip() for o in _allowed_origins_raw.split(',') if o.strip()]
+CORS(app, origins=_allowed_origins)
 db.init_app(app)
+
+# ── Rate limiting ────────────────────────────────────────────────
+# Protects both your Earth Engine quota and your hosting bill from
+# accidental (or malicious) request floods. Falls back to an in-memory
+# limiter if no separate storage is configured — fine for a single
+# backend instance, upgrade to Redis storage if you ever run multiple.
+try:
+    from flask_limiter import Limiter
+    from flask_limiter.util import get_remote_address
+    limiter = Limiter(
+        app=app, key_func=get_remote_address,
+        default_limits=['200 per hour'],
+        storage_uri=os.getenv('RATELIMIT_STORAGE_URI', 'memory://'),
+    )
+    logger.info('Rate limiting active.')
+except Exception as e:
+    limiter = None
+    logger.warning(f'Rate limiting unavailable (continuing without it): {e}')
+
+def rate_limit(limit_string):
+    """A limit decorator that's a no-op if flask-limiter didn't load —
+    every route can use this unconditionally without extra if-checks."""
+    def decorator(f):
+        return limiter.limit(limit_string)(f) if limiter else f
+    return decorator
 
 app.register_blueprint(auth_bp, url_prefix='/api/auth')
 app.register_blueprint(payments_bp, url_prefix='/api/payments')
@@ -66,6 +121,7 @@ def health():
 @app.route('/api/analysis/run', methods=['POST'])
 @token_required
 @subscription_required
+@rate_limit('30 per hour')
 def analysis_run(user):
     d = request.get_json()
     family, index_v = d.get('family'), d.get('index')
@@ -76,9 +132,16 @@ def analysis_run(user):
     if len(coords) < 3:
         return jsonify({'error': 'Region needs at least 3 points.'}), 400
 
-    result = gee_engine.run_reading(family, index_v, start, end, coords)
-    if 'error' in result:
-        return jsonify(result), 422
+    # Serve from cache when possible — identical region/dates/index
+    # returns instantly instead of re-running Earth Engine.
+    result = result_cache.get(family, index_v, start, end, coords)
+    if result is None:
+        result = gee_engine.run_reading(family, index_v, start, end, coords)
+        if 'error' in result:
+            return jsonify(result), 422
+        result_cache.set(family, index_v, start, end, coords, result)
+    else:
+        logger.info(f'Cache hit: {family}/{index_v} {start}->{end}')
 
     reading = Reading(
         user_id=user.id, family=family, index_name=index_v,
@@ -97,6 +160,7 @@ def analysis_run(user):
 @app.route('/api/analysis/timeseries', methods=['POST'])
 @token_required
 @subscription_required
+@rate_limit('15 per hour')
 def analysis_timeseries(user):
     d = request.get_json()
     family, index_v = d.get('family'), d.get('index')

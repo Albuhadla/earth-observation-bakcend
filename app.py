@@ -13,6 +13,7 @@ Earth Observation and Analysis — Backend
   GET  /api/analysis/history     This user's saved readings
 """
 import os, logging
+from datetime import datetime
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -104,6 +105,28 @@ def subscription_required(f):
     return wrapper
 
 
+def enterprise_required(f):
+    """
+    Like subscription_required, but specifically for the Enterprise
+    tier's advanced analytics tools (tree counting, water body
+    inventory, land classification) — these are meaningfully more
+    computationally expensive than a normal reading, so they're kept
+    as a distinct, higher-tier feature rather than bundled into every
+    plan.
+    """
+    import functools
+    @functools.wraps(f)
+    def wrapper(user, *args, **kwargs):
+        if not user.has_access():
+            return jsonify({'error': 'Your trial or subscription has ended. Please subscribe to continue.',
+                             'code': 'SUBSCRIPTION_REQUIRED'}), 402
+        if user.plan != 'enterprise':
+            return jsonify({'error': 'Advanced analytics (tree counting, water body inventory, land classification) require the Enterprise plan.',
+                             'code': 'ENTERPRISE_REQUIRED'}), 402
+        return f(user, *args, **kwargs)
+    return wrapper
+
+
 @app.route('/api/health')
 def health():
     # Actually attempt initialisation here (not just check the package
@@ -116,6 +139,43 @@ def health():
         'gee_available': ee_ready,
         'gee_init_error': gee_engine._last_ee_init_error if not ee_ready else None
     })
+
+
+@app.route('/api/analysis/advanced', methods=['POST'])
+@token_required
+@enterprise_required
+@rate_limit('10 per hour')
+def analysis_advanced(user):
+    d = request.get_json()
+    tool = d.get('tool')
+    start, end, coords = d.get('start'), d.get('end'), d.get('roi')
+
+    if not all([tool, start, end, coords]):
+        return jsonify({'error': 'tool, start, end and roi are all required.'}), 400
+    if len(coords) < 3:
+        return jsonify({'error': 'Region needs at least 3 points.'}), 400
+
+    if tool == 'treeCount':
+        result = gee_engine.run_tree_count(start, end, coords)
+    elif tool == 'waterBodies':
+        result = gee_engine.run_water_bodies(start, end, coords)
+    elif tool == 'landClassify':
+        n_clusters = int(d.get('n_clusters', 5))
+        result = gee_engine.run_land_classify(start, end, coords, n_clusters=n_clusters)
+    else:
+        return jsonify({'error': f'Unknown advanced tool: {tool}'}), 400
+
+    if 'error' in result:
+        return jsonify(result), 422
+    return jsonify(result)
+
+
+PLAN_FAMILY_ACCESS = {
+    'basic':      {'water', 'veg'},
+    'pro':        {'water', 'veg', 'landsat', 'geo', 'urban'},
+    'enterprise': {'water', 'veg', 'landsat', 'geo', 'urban', 'archaeology'},
+}
+PLAN_MONTHLY_LIMIT = {'basic': 50, 'pro': 300, 'enterprise': None}  # None = unlimited
 
 
 @app.route('/api/analysis/run', methods=['POST'])
@@ -131,6 +191,28 @@ def analysis_run(user):
         return jsonify({'error': 'family, index, start, end and roi are all required.'}), 400
     if len(coords) < 3:
         return jsonify({'error': 'Region needs at least 3 points.'}), 400
+
+    # Plan-based family access — e.g. Basic can't reach Geology/Urban/
+    # Archaeology, Pro can't reach Archaeology & Terrain specifically.
+    allowed_families = PLAN_FAMILY_ACCESS.get(user.plan, PLAN_FAMILY_ACCESS['basic'])
+    if family not in allowed_families:
+        return jsonify({
+            'error': f'The "{family}" family isn\'t included in your {user.plan.title()} plan. Upgrade to unlock it.',
+            'code': 'PLAN_UPGRADE_REQUIRED'
+        }), 402
+
+    # Plan-based monthly reading quota
+    limit = PLAN_MONTHLY_LIMIT.get(user.plan)
+    if limit is not None:
+        month_start = datetime.utcnow().replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        used_this_month = Reading.query.filter(
+            Reading.user_id == user.id, Reading.created_at >= month_start
+        ).count()
+        if used_this_month >= limit:
+            return jsonify({
+                'error': f'You\'ve used all {limit} readings included in your {user.plan.title()} plan this month. Upgrade for more.',
+                'code': 'QUOTA_REACHED'
+            }), 402
 
     # Serve from cache when possible — identical region/dates/index
     # returns instantly instead of re-running Earth Engine.

@@ -479,6 +479,207 @@ def run_reading(family, index_v, start_date, end_date, coords):
         return simulate(family, index_v, start_date, end_date, real_error=str(e))
 
 
+# ══════════════════════════════════════════════════════════════
+# ADVANCED ANALYTICS — Enterprise-only
+# Real object counting and classification, not just index readings.
+# ══════════════════════════════════════════════════════════════
+
+def run_tree_count(start_date, end_date, coords):
+    """
+    Counts individual tree/palm crowns within a farm boundary using
+    local-maxima detection on a vegetation index — each isolated peak
+    in greenness corresponds to one tree canopy centre. Works best on
+    mature, moderately-spaced trees (palm/date orchards are a classic
+    fit); very dense or young plantings will under-count since
+    touching crowns merge into a single peak.
+    """
+    if not (EE_AVAILABLE and init_ee()):
+        return _simulate_advanced('treeCount', coords)
+    try:
+        roi = roi_from_coords(coords)
+        coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                .filterBounds(roi).filterDate(start_date, end_date)
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
+        count_imgs = coll.size().getInfo()
+        if count_imgs == 0:
+            return {'error': 'No Sentinel-2 images for this period/region.'}
+
+        composite = coll.map(mask_s2).median().clip(roi)
+        ndvi = composite.normalizedDifference(['B8', 'B4'])
+
+        # Local-maxima peak detection — a pixel is a tree centre if it's
+        # the brightest (greenest) pixel within its neighbourhood AND
+        # actually vegetated (excludes bare-soil/noise local maxima).
+        kernel = ee.Kernel.circle(radius=1, units='pixels')  # ~10m — typical mature palm spacing
+        local_max = ndvi.focalMax(kernel=kernel)
+        peaks = ndvi.eq(local_max).And(ndvi.gt(0.35)).selfMask()
+
+        area_ha = ee.Number(roi.area(1)).divide(10000)
+        tree_count = peaks.reduceRegion(
+            reducer=ee.Reducer.count(), geometry=roi, scale=10,
+            bestEffort=True, maxPixels=1e9
+        ).getInfo()
+        n_trees = int(tree_count.get('nd', 0) or 0)
+        area_ha_val = area_ha.getInfo()
+        density = round(n_trees / area_ha_val, 1) if area_ha_val > 0 else 0
+
+        # Visual: true-colour base with detected tree centres highlighted
+        dims = compute_optimal_dimensions(roi, 10)
+        thumb_url = None
+        try:
+            highlight = composite.visualize(bands=['B4','B3','B2'], min=0, max=0.3, gamma=1.2)
+            dots = peaks.visualize(palette=['ff3b30'], forceRgbOutput=True)
+            combined = ee.ImageCollection([highlight, dots.updateMask(peaks)]).mosaic()
+            thumb_url = combined.clip(roi).getThumbURL({'region': roi, 'dimensions': dims, 'format': 'png'})
+        except Exception as e:
+            logger.warning(f'Tree count thumbnail failed: {e}')
+
+        return {
+            'tool': 'treeCount', 'source': 'gee_live', 'images': count_imgs,
+            'count': n_trees, 'area_ha': round(area_ha_val, 2), 'density_per_ha': density,
+            'thumb_url': thumb_url,
+        }
+    except Exception as e:
+        logger.error(f'Tree count error: {e}')
+        return _simulate_advanced('treeCount', coords, real_error=str(e))
+
+
+def run_water_bodies(start_date, end_date, coords):
+    """
+    Counts and sizes distinct water bodies (lakes, reservoirs, ponds)
+    within a region using connected-component labelling on an NDWI
+    water mask — each isolated cluster of water pixels is one body.
+    Suitable for regional/national-scale inventories, not just a
+    single lake.
+    """
+    if not (EE_AVAILABLE and init_ee()):
+        return _simulate_advanced('waterBodies', coords)
+    try:
+        roi = roi_from_coords(coords)
+        coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                .filterBounds(roi).filterDate(start_date, end_date)
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
+        count_imgs = coll.size().getInfo()
+        if count_imgs == 0:
+            return {'error': 'No Sentinel-2 images for this period/region.'}
+
+        composite = coll.map(mask_s2).median().clip(roi)
+        water_mask = composite.normalizedDifference(['B3', 'B8']).gt(0.0).selfMask()
+
+        # Label each connected group of water pixels as one distinct body.
+        # Scale kept coarse (30m) so large-region queries (e.g. a whole
+        # country) stay computationally tractable.
+        labeled = water_mask.connectedComponents(connectedness=ee.Kernel.plus(1), maxSize=4096)
+
+        n_bodies = labeled.select('labels').reduceRegion(
+            reducer=ee.Reducer.countDistinct(), geometry=roi, scale=30,
+            bestEffort=True, maxPixels=1e10
+        ).getInfo()
+        body_count = int(n_bodies.get('labels', 0) or 0)
+
+        area_stats = water_mask.multiply(ee.Image.pixelArea()).reduceRegion(
+            reducer=ee.Reducer.sum(), geometry=roi, scale=30, bestEffort=True, maxPixels=1e10
+        ).getInfo()
+        total_water_ha = round((area_stats.get('nd', 0) or 0) / 10000, 2)
+
+        dims = compute_optimal_dimensions(roi, 30)
+        thumb_url = None
+        try:
+            vis = labeled.select('labels').randomVisualizer()
+            thumb_url = vis.clip(roi).getThumbURL({'region': roi, 'dimensions': dims, 'format': 'png'})
+        except Exception as e:
+            logger.warning(f'Water body thumbnail failed: {e}')
+
+        return {
+            'tool': 'waterBodies', 'source': 'gee_live', 'images': count_imgs,
+            'count': body_count, 'total_water_ha': total_water_ha,
+            'thumb_url': thumb_url,
+        }
+    except Exception as e:
+        logger.error(f'Water body count error: {e}')
+        return _simulate_advanced('waterBodies', coords, real_error=str(e))
+
+
+def run_land_classify(start_date, end_date, coords, n_clusters=5):
+    """
+    Unsupervised K-Means classification — automatically segments any
+    region into distinct land cover clusters (water, vegetation,
+    bare soil, built-up, etc.) without needing labelled training data.
+    Reports the area each cluster covers.
+    """
+    if not (EE_AVAILABLE and init_ee()):
+        return _simulate_advanced('landClassify', coords)
+    try:
+        roi = roi_from_coords(coords)
+        coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                .filterBounds(roi).filterDate(start_date, end_date)
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
+        count_imgs = coll.size().getInfo()
+        if count_imgs == 0:
+            return {'error': 'No Sentinel-2 images for this period/region.'}
+
+        composite = coll.map(mask_s2).median().clip(roi)
+        bands = ['B2', 'B3', 'B4', 'B8', 'B11']
+        training = composite.select(bands).sample(
+            region=roi, scale=10, numPixels=5000, seed=42, geometries=False
+        )
+        clusterer = ee.Clusterer.wekaKMeans(n_clusters).train(training)
+        classified = composite.select(bands).cluster(clusterer)
+
+        area_img = ee.Image.pixelArea().addBands(classified.rename('cluster'))
+        grouped = area_img.reduceRegion(
+            reducer=ee.Reducer.sum().group(groupField=1, groupName='cluster'),
+            geometry=roi, scale=10, bestEffort=True, maxPixels=1e10
+        ).getInfo()
+
+        groups = grouped.get('groups', [])
+        total_area = sum(g['sum'] for g in groups) or 1
+        classes = sorted(
+            [{'id': int(g['cluster']), 'area_ha': round(g['sum']/10000, 2),
+              'pct': round(g['sum']/total_area*100, 1)} for g in groups],
+            key=lambda c: -c['area_ha']
+        )
+
+        dims = compute_optimal_dimensions(roi, 10)
+        thumb_url = None
+        try:
+            palette = ['3288bd','66c2a5','abdda4','fee08b','fdae61','d53e4f','9e0142','5e4fa2','f46d43','e6f598']
+            vis = classified.visualize(min=0, max=n_clusters-1, palette=palette[:n_clusters])
+            thumb_url = vis.clip(roi).getThumbURL({'region': roi, 'dimensions': dims, 'format': 'png'})
+        except Exception as e:
+            logger.warning(f'Land classify thumbnail failed: {e}')
+
+        return {
+            'tool': 'landClassify', 'source': 'gee_live', 'images': count_imgs,
+            'num_classes': len(classes), 'classes': classes,
+            'thumb_url': thumb_url,
+        }
+    except Exception as e:
+        logger.error(f'Land classification error: {e}')
+        return _simulate_advanced('landClassify', coords, real_error=str(e))
+
+
+def _simulate_advanced(tool, coords, real_error=None):
+    """Fallback for the 3 advanced tools when GEE is unavailable."""
+    rng = random.Random(_seed('adv', tool, str(len(coords))))
+    note = (f'GEE call failed, showing simulated data. Real error: {real_error}'
+            if real_error else 'GEE credentials not configured on the server — showing simulated data.')
+    if tool == 'treeCount':
+        count = rng.randint(80, 900)
+        return {'tool':'treeCount','source':'simulated','images':rng.randint(10,40),
+                'count':count, 'area_ha':round(count/rng.uniform(80,150),2),
+                'density_per_ha':round(rng.uniform(80,150),1), 'note':note}
+    if tool == 'waterBodies':
+        count = rng.randint(5, 400)
+        return {'tool':'waterBodies','source':'simulated','images':rng.randint(10,40),
+                'count':count, 'total_water_ha':round(count*rng.uniform(2,40),2), 'note':note}
+    classes = [{'id':i,'area_ha':round(rng.uniform(50,2000),2),'pct':0} for i in range(5)]
+    total = sum(c['area_ha'] for c in classes) or 1
+    for c in classes: c['pct'] = round(c['area_ha']/total*100,1)
+    return {'tool':'landClassify','source':'simulated','images':rng.randint(10,40),
+            'num_classes':5, 'classes':classes, 'note':note}
+
+
 def run_timeseries(family, index_v, start_date, end_date, coords):
     # Elevation/slope are static terrain data, not a time series — a
     # monthly trend chart doesn't apply to them the way it does to an

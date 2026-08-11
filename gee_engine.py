@@ -169,6 +169,24 @@ def compute_optimal_dimensions(roi, native_scale, min_dim=350, max_dim=1024):
         return 640
 
 
+def compute_adaptive_scale(roi_area_m2, native_scale, target_pixels=2_000_000):
+    """
+    A huge region computed at native 10m resolution can mean tens of
+    millions of pixels for a single reduceRegion() call — that's what
+    was actually causing "large regions always come back simulated"
+    (the request took longer than the server's timeout, not a real
+    Earth Engine failure, and no GEE tier fixes a client-side timeout).
+    This keeps total pixel count roughly bounded by using a coarser
+    scale for bigger regions, the same trade-off real GIS tools make
+    automatically — full native detail on a farm, sensible fast
+    aggregation on a whole country.
+    """
+    if roi_area_m2 <= 0:
+        return native_scale
+    ideal_scale = math.sqrt(roi_area_m2 / target_pixels)
+    return max(native_scale, round(ideal_scale))
+
+
 def safe_thumb_url(index_v, roi, img=None, composite=None):
     """
     Generate a real, GEE-rendered PNG of the actual computed layer,
@@ -450,10 +468,18 @@ def run_reading(family, index_v, start_date, end_date, coords):
         else:
             return {'error': f'Unknown family: {family}'}
 
+        # Adapt resolution to region size — this is the actual fix for
+        # "huge regions always time out and fall back to simulated data".
+        # bestEffort alone doesn't prevent a request from simply taking
+        # too long; this keeps the pixel count (and therefore compute
+        # time) roughly bounded regardless of how large the drawn area is.
+        roi_area_m2 = roi.area(1).getInfo()
+        effective_scale = compute_adaptive_scale(roi_area_m2, scale)
+
         stats = img.select('value').reduceRegion(
             reducer=ee.Reducer.mean().combine(ee.Reducer.minMax(), sharedInputs=True)
                                      .combine(ee.Reducer.stdDev(), sharedInputs=True),
-            geometry=roi, scale=scale, bestEffort=True, maxPixels=1e9, tileScale=4
+            geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e9, tileScale=4
         ).getInfo()
 
         mean = stats.get('value_mean')
@@ -566,19 +592,23 @@ def run_water_bodies(start_date, end_date, coords):
         composite = coll.map(mask_s2).median().clip(roi)
         water_mask = composite.normalizedDifference(['B3', 'B8']).gt(0.0).selfMask()
 
+        # Adapt scale to region size — this is what actually keeps a
+        # whole-country query from timing out, rather than the fixed 30m
+        # that was still too fine (too many pixels) for very large areas.
+        roi_area_m2 = roi.area(1).getInfo()
+        effective_scale = compute_adaptive_scale(roi_area_m2, 30, target_pixels=3_000_000)
+
         # Label each connected group of water pixels as one distinct body.
-        # Scale kept coarse (30m) so large-region queries (e.g. a whole
-        # country) stay computationally tractable.
         labeled = water_mask.connectedComponents(connectedness=ee.Kernel.plus(1), maxSize=4096)
 
         n_bodies = labeled.select('labels').reduceRegion(
-            reducer=ee.Reducer.countDistinct(), geometry=roi, scale=30,
+            reducer=ee.Reducer.countDistinct(), geometry=roi, scale=effective_scale,
             bestEffort=True, maxPixels=1e10
         ).getInfo()
         body_count = int(n_bodies.get('labels', 0) or 0)
 
         area_stats = water_mask.multiply(ee.Image.pixelArea()).reduceRegion(
-            reducer=ee.Reducer.sum(), geometry=roi, scale=30, bestEffort=True, maxPixels=1e10
+            reducer=ee.Reducer.sum(), geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10
         ).getInfo()
         total_water_ha = round((area_stats.get('nd', 0) or 0) / 10000, 2)
 
@@ -626,10 +656,17 @@ def run_land_classify(start_date, end_date, coords, n_clusters=5):
         clusterer = ee.Clusterer.wekaKMeans(n_clusters).train(training)
         classified = composite.select(bands).cluster(clusterer)
 
+        # Adapt scale to region size — the training sample stays fixed
+        # (5000 points regardless of area), but the area-per-class
+        # reduction over the full region needs this to stay fast on
+        # large regions.
+        roi_area_m2 = roi.area(1).getInfo()
+        effective_scale = compute_adaptive_scale(roi_area_m2, 10, target_pixels=3_000_000)
+
         area_img = ee.Image.pixelArea().addBands(classified.rename('cluster'))
         grouped = area_img.reduceRegion(
             reducer=ee.Reducer.sum().group(groupField=1, groupName='cluster'),
-            geometry=roi, scale=10, bestEffort=True, maxPixels=1e10
+            geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10
         ).getInfo()
 
         groups = grouped.get('groups', [])

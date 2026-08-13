@@ -141,6 +141,54 @@ def health():
     })
 
 
+@app.route('/api/test/watershed', methods=['POST'])
+@token_required
+def test_watershed(user):
+    """
+    ISOLATED test route — deliberately not part of the main analysis
+    pipeline. Checks 5 proposed watershed-analysis capabilities
+    (basin boundaries, stream network, rainfall, flood-risk zones,
+    population at risk) against a real region, so we can see exactly
+    which real Earth Engine datasets work before building any UI
+    around them. Safe to remove once testing is done, or keep as a
+    permanent internal diagnostic — doesn't affect anything else.
+    """
+    try:
+        import watershed_test
+    except Exception as e:
+        return jsonify({'error': f'Test module failed to load: {e}'}), 500
+
+    d = request.get_json()
+    start, end, coords = d.get('start'), d.get('end'), d.get('roi')
+    if not all([start, end, coords]):
+        return jsonify({'error': 'start, end and roi are all required.'}), 400
+
+    result = watershed_test.run_all_watershed_tests(start, end, coords)
+    return jsonify(result)
+
+
+@app.route('/api/analysis/changemap', methods=['POST'])
+@token_required
+@subscription_required
+@rate_limit('15 per hour')
+def analysis_changemap(user):
+    d = request.get_json()
+    family, index_v = d.get('family'), d.get('index')
+    start1, end1 = d.get('start1'), d.get('end1')
+    start2, end2 = d.get('start2'), d.get('end2')
+    coords = d.get('roi')
+
+    if not all([family, index_v, start1, end1, start2, end2, coords]):
+        return jsonify({'error': 'family, index, start1, end1, start2, end2 and roi are all required.'}), 400
+    if len(coords) < 3:
+        return jsonify({'error': 'Region needs at least 3 points.'}), 400
+
+    result = gee_engine.run_change_map(family, index_v, start1, end1, start2, end2, coords)
+    if 'error' in result:
+        return jsonify(result), 422
+    return jsonify(result)
+
+
 @app.route('/api/analysis/advanced', methods=['POST'])
 @token_required
 @enterprise_required

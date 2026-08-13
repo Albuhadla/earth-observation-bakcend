@@ -323,6 +323,204 @@ def vegetation_image(s2, index_v):
     return img.rename('value').updateMask(shoreline_mask)
 
 
+# ══════════════════════════════════════════════════════════════
+# CHANGE MAP & HOTSPOT DETECTION
+# Two periods of the same index, compared pixel-by-pixel — classifies
+# every pixel as increased/stable/decreased, computes area per class,
+# and automatically ranks the zones of largest change as prioritised
+# hotspots. Reuses the exact connected-component technique already
+# proven in Water Body Inventory.
+# ══════════════════════════════════════════════════════════════
+
+def get_composite_and_index(family, index_v, roi, start_date, end_date):
+    """
+    Shared helper — builds the composite and computes the single-band
+    'value' image for a given family/index/date range. Returns
+    (composite, img, image_count), or (None, None, 0) if that specific
+    index has no single comparable value (true-colour composites) or
+    no imagery was found.
+    """
+    try:
+        if family == 'water':
+            coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                    .filterBounds(roi).filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+            count = coll.size().getInfo()
+            if count == 0: return None, None, 0
+            composite = coll.map(mask_s2).median().clip(roi)
+            return composite, water_index_image(composite, index_v), count
+
+        elif family == 'landsat':
+            if index_v not in ('ndvi', 'mndwi', 'ndbi'):
+                return None, None, 0  # RGB combos have no single comparable value
+            coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+                    .filterBounds(roi).filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUD_COVER', 30)))
+            count = coll.size().getInfo()
+            if count == 0: return None, None, 0
+            composite = coll.map(mask_l9).median().clip(roi)
+            return composite, landsat_combo_image(composite, index_v), count
+
+        elif family == 'geo':
+            coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+                    .filterBounds(roi).filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUD_COVER', 30)))
+            count = coll.size().getInfo()
+            if count == 0: return None, None, 0
+            composite = coll.map(mask_l9).median().clip(roi)
+            return composite, geology_image(composite, index_v), count
+
+        elif family == 'veg':
+            coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                    .filterBounds(roi).filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+            count = coll.size().getInfo()
+            if count == 0: return None, None, 0
+            composite = coll.map(mask_s2).median().clip(roi)
+            return composite, vegetation_image(composite, index_v), count
+
+        elif family == 'urban':
+            if index_v == 'nightlights':
+                coll = ee.ImageCollection('NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG').filterBounds(roi).filterDate(start_date, end_date)
+                count = coll.size().getInfo()
+                if count == 0: return None, None, 0
+                composite = coll.select('avg_rad').median().clip(roi)
+                return composite, composite.max(0).rename('value'), count
+            elif index_v == 'ubndbi':
+                coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+                        .filterBounds(roi).filterDate(start_date, end_date)
+                        .filter(ee.Filter.lt('CLOUD_COVER', 30)))
+                count = coll.size().getInfo()
+                if count == 0: return None, None, 0
+                composite = coll.map(mask_l9).median().clip(roi)
+                return composite, composite.normalizedDifference(['SR_B6', 'SR_B5']).rename('value'), count
+            else:
+                return None, None, 0  # s2rgb — true colour, no single value
+        else:
+            return None, None, 0
+    except Exception as e:
+        logger.warning(f'get_composite_and_index failed for {family}/{index_v}: {e}')
+        return None, None, 0
+
+
+def run_change_map(family, index_v, start1, end1, start2, end2, coords):
+    """
+    Compares the same index across two periods pixel-by-pixel. Returns
+    area breakdown (increased/stable/decreased) plus automatically
+    detected, ranked hotspot zones — the same kind of "before/after/
+    change" map and priority table a professional EO report would
+    include, rather than just two separate readings.
+    """
+    if not (EE_AVAILABLE and init_ee()):
+        return {'error': 'GEE not available on this server right now — check /api/health first.'}
+    try:
+        roi = roi_from_coords(coords)
+
+        composite1, img1, count1 = get_composite_and_index(family, index_v, roi, start1, end1)
+        if img1 is None:
+            return {'error': 'No imagery found for the first period, or this index doesn\'t support change-map analysis (true-colour composites have no single comparable value).'}
+
+        composite2, img2, count2 = get_composite_and_index(family, index_v, roi, start2, end2)
+        if img2 is None:
+            return {'error': 'No imagery found for the second period.'}
+
+        val1 = img1.select('value')
+        val2 = img2.select('value')
+        diff = val2.subtract(val1).rename('diff')
+
+        lo, hi = RANGES.get(index_v, (0, 1))
+        span = hi - lo
+        sig_threshold = span * 0.12  # 12% of the index's typical range = "significant" change
+
+        roi_area_m2 = roi.area(1).getInfo()
+        native_scale = NATIVE_SCALE.get(index_v, 30)
+        effective_scale = compute_adaptive_scale(roi_area_m2, native_scale, target_pixels=1_500_000)
+
+        classified = (ee.Image(0)
+                      .where(diff.gt(sig_threshold), 1)
+                      .where(diff.lt(-sig_threshold), -1)
+                      .rename('cls').updateMask(diff.mask()))
+
+        area_img = ee.Image.pixelArea().addBands(classified)
+        grouped = area_img.reduceRegion(
+            reducer=ee.Reducer.sum().group(groupField=1, groupName='cls'),
+            geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10
+        ).getInfo()
+        class_ha = {-1: 0.0, 0: 0.0, 1: 0.0}
+        for g in grouped.get('groups', []):
+            class_ha[int(g['cls'])] = (g.get('sum') or 0) / 10000
+        total_ha = sum(class_ha.values()) or 1
+
+        mean_stats = ee.Image.cat([val1.rename('start'), val2.rename('end')]).reduceRegion(
+            reducer=ee.Reducer.mean(), geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e9
+        ).getInfo()
+        start_mean = mean_stats.get('start')
+        end_mean = mean_stats.get('end')
+        overall_change_pct = None
+        if start_mean not in (None, 0):
+            overall_change_pct = round((end_mean - start_mean) / abs(start_mean) * 100, 1)
+
+        # ── Hotspot detection — zones of largest significant change ──
+        hotspots = []
+        try:
+            sig_mask = diff.abs().gt(sig_threshold).selfMask()
+            labeled = sig_mask.connectedComponents(connectedness=ee.Kernel.plus(1), maxSize=1024)
+            zones_fc = labeled.select('labels').reduceToVectors(
+                geometry=roi, scale=effective_scale, geometryType='polygon',
+                maxPixels=1e10, bestEffort=True, labelProperty='zone_id'
+            )
+            zones_fc = zones_fc.map(lambda f: f.set('area_ha', f.geometry().area(1).divide(10000)))
+            zones_fc = zones_fc.sort('area_ha', False).limit(8)
+            zone_stats_fc = diff.reduceRegions(collection=zones_fc, reducer=ee.Reducer.mean(), scale=effective_scale)
+
+            letters = 'ABCDEFGH'
+            raw_zones = []
+            for i, f in enumerate(zone_stats_fc.getInfo().get('features', [])):
+                props = f.get('properties', {})
+                area_ha = round(props.get('area_ha', 0) or 0, 2)
+                mean_change = props.get('mean')
+                if area_ha < 0.5 or mean_change is None:
+                    continue  # skip noise-sized zones
+                raw_zones.append({'area_ha': area_ha, 'mean_change': round(mean_change, 4)})
+
+            raw_zones.sort(key=lambda h: -(h['area_ha'] * abs(h['mean_change'])))
+            for i, z in enumerate(raw_zones[:5]):
+                hotspots.append({
+                    'zone': letters[i] if i < len(letters) else str(i + 1),
+                    'area_ha': z['area_ha'],
+                    'mean_change': z['mean_change'],
+                    'direction': 'increase' if z['mean_change'] > 0 else 'decrease',
+                    'priority': 'High' if i == 0 else 'Medium' if i == 1 else 'Low',
+                })
+        except Exception as e:
+            logger.warning(f'Hotspot detection failed (non-fatal, continuing without it): {e}')
+
+        # ── Visualisation: diverging palette, red=decrease, grey=stable, green=increase ──
+        dims = compute_optimal_dimensions(roi, native_scale)
+        thumb_url = None
+        try:
+            vis = classified.visualize(min=-1, max=1, palette=['d73027', 'bdbdbd', '1a9850'])
+            thumb_url = vis.clip(roi).getThumbURL({'region': roi, 'dimensions': dims, 'format': 'png'})
+        except Exception as e:
+            logger.warning(f'Change map thumbnail failed: {e}')
+
+        return {
+            'source': 'gee_live',
+            'images_period1': count1, 'images_period2': count2,
+            'start_mean': round(start_mean, 4) if start_mean is not None else None,
+            'end_mean': round(end_mean, 4) if end_mean is not None else None,
+            'overall_change_pct': overall_change_pct,
+            'increased_ha': round(class_ha[1], 2), 'increased_pct': round(class_ha[1] / total_ha * 100, 1),
+            'stable_ha': round(class_ha[0], 2), 'stable_pct': round(class_ha[0] / total_ha * 100, 1),
+            'decreased_ha': round(class_ha[-1], 2), 'decreased_pct': round(class_ha[-1] / total_ha * 100, 1),
+            'hotspots': hotspots,
+            'thumb_url': thumb_url,
+        }
+    except Exception as e:
+        logger.error(f'Change map error: {e}')
+        return {'error': str(e)}
+
+
 # ── main entry point ────────────────────────────────────────────
 
 def run_reading(family, index_v, start_date, end_date, coords):

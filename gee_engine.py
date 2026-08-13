@@ -344,7 +344,8 @@ def get_composite_and_index(family, index_v, roi, start_date, end_date):
         if family == 'water':
             coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                     .filterBounds(roi).filterDate(start_date, end_date)
-                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+                    .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
             count = coll.size().getInfo()
             if count == 0: return None, None, 0
             composite = coll.map(mask_s2).median().clip(roi)
@@ -373,7 +374,8 @@ def get_composite_and_index(family, index_v, roi, start_date, end_date):
         elif family == 'veg':
             coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                     .filterBounds(roi).filterDate(start_date, end_date)
-                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+                    .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
             count = coll.size().getInfo()
             if count == 0: return None, None, 0
             composite = coll.map(mask_s2).median().clip(roi)
@@ -544,9 +546,17 @@ def run_reading(family, index_v, start_date, end_date, coords):
         roi = roi_from_coords(coords)
 
         if family in ('water',):
+            # Capped to the 30 clearest images — without this, a long
+            # date range means Earth Engine has to merge potentially
+            # dozens of images every single time, which is what was
+            # actually causing "preview takes over a minute" (this
+            # affects every Sentinel-2 family equally, not just water).
+            # Sorting by cloud cover first means we lose nothing in
+            # quality — if anything the composite gets cleaner.
             coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                     .filterBounds(roi).filterDate(start_date, end_date)
-                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+                    .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
             count = coll.size().getInfo()
             if count == 0: return {'error': 'No Sentinel-2 images for this period/region.'}
             composite = coll.map(mask_s2).median().clip(roi)
@@ -576,7 +586,8 @@ def run_reading(family, index_v, start_date, end_date, coords):
         elif family == 'veg':
             coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                     .filterBounds(roi).filterDate(start_date, end_date)
-                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+                    .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
             count = coll.size().getInfo()
             if count == 0: return {'error': 'No Sentinel-2 images for this period/region.'}
             composite = coll.map(mask_s2).median().clip(roi)
@@ -606,7 +617,8 @@ def run_reading(family, index_v, start_date, end_date, coords):
                 # than the main analysis it's paired with.
                 coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                         .filterBounds(roi).filterDate(start_date, end_date)
-                        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+                        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+                        .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
                 count = coll.size().getInfo()
                 if count == 0: return {'error': 'No Sentinel-2 images for this period/region.'}
                 composite = coll.map(mask_s2).median().clip(roi)
@@ -652,7 +664,8 @@ def run_reading(family, index_v, start_date, end_date, coords):
                 # highlights these deviations instead of overall greenness.
                 coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                         .filterBounds(roi).filterDate(start_date, end_date)
-                        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
+                        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+                        .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
                 count = coll.size().getInfo()
                 if count == 0: return {'error': 'No Sentinel-2 images for this period/region.'}
                 composite = coll.map(mask_s2).median().clip(roi)
@@ -731,7 +744,8 @@ def run_tree_count(start_date, end_date, coords):
         roi = roi_from_coords(coords)
         coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                 .filterBounds(roi).filterDate(start_date, end_date)
-                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+                .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
         count_imgs = coll.size().getInfo()
         if count_imgs == 0:
             return {'error': 'No Sentinel-2 images for this period/region.'}
@@ -749,7 +763,7 @@ def run_tree_count(start_date, end_date, coords):
         area_ha = ee.Number(roi.area(1)).divide(10000)
         tree_count = peaks.reduceRegion(
             reducer=ee.Reducer.count(), geometry=roi, scale=10,
-            bestEffort=True, maxPixels=1e9
+            bestEffort=True, maxPixels=1e9, tileScale=4
         ).getInfo()
         n_trees = int(tree_count.get('nd', 0) or 0)
         area_ha_val = area_ha.getInfo()
@@ -790,7 +804,8 @@ def run_water_bodies(start_date, end_date, coords):
         roi = roi_from_coords(coords)
         coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                 .filterBounds(roi).filterDate(start_date, end_date)
-                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+                .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
         count_imgs = coll.size().getInfo()
         if count_imgs == 0:
             return {'error': 'No Sentinel-2 images for this period/region.'}
@@ -805,16 +820,19 @@ def run_water_bodies(start_date, end_date, coords):
         effective_scale = compute_adaptive_scale(roi_area_m2, 30, target_pixels=3_000_000)
 
         # Label each connected group of water pixels as one distinct body.
-        labeled = water_mask.connectedComponents(connectedness=ee.Kernel.plus(1), maxSize=4096)
+        # maxSize capped lower + tileScale added — the same fix that
+        # solved "User memory limit exceeded" on the Change Map feature;
+        # connectedComponents is one of Earth Engine's heaviest operations.
+        labeled = water_mask.connectedComponents(connectedness=ee.Kernel.plus(1), maxSize=256)
 
         n_bodies = labeled.select('labels').reduceRegion(
             reducer=ee.Reducer.countDistinct(), geometry=roi, scale=effective_scale,
-            bestEffort=True, maxPixels=1e10
+            bestEffort=True, maxPixels=1e10, tileScale=8
         ).getInfo()
         body_count = int(n_bodies.get('labels', 0) or 0)
 
         area_stats = water_mask.multiply(ee.Image.pixelArea()).reduceRegion(
-            reducer=ee.Reducer.sum(), geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10
+            reducer=ee.Reducer.sum(), geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10, tileScale=4
         ).getInfo()
         total_water_ha = round((area_stats.get('nd', 0) or 0) / 10000, 2)
 
@@ -849,7 +867,8 @@ def run_land_classify(start_date, end_date, coords, n_clusters=5):
         roi = roi_from_coords(coords)
         coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
                 .filterBounds(roi).filterDate(start_date, end_date)
-                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30)))
+                .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 30))
+                .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
         count_imgs = coll.size().getInfo()
         if count_imgs == 0:
             return {'error': 'No Sentinel-2 images for this period/region.'}
@@ -857,7 +876,7 @@ def run_land_classify(start_date, end_date, coords, n_clusters=5):
         composite = coll.map(mask_s2).median().clip(roi)
         bands = ['B2', 'B3', 'B4', 'B8', 'B11']
         training = composite.select(bands).sample(
-            region=roi, scale=10, numPixels=5000, seed=42, geometries=False
+            region=roi, scale=10, numPixels=5000, seed=42, geometries=False, tileScale=4
         )
         clusterer = ee.Clusterer.wekaKMeans(n_clusters).train(training)
         classified = composite.select(bands).cluster(clusterer)
@@ -872,7 +891,7 @@ def run_land_classify(start_date, end_date, coords, n_clusters=5):
         area_img = ee.Image.pixelArea().addBands(classified.rename('cluster'))
         grouped = area_img.reduceRegion(
             reducer=ee.Reducer.sum().group(groupField=1, groupName='cluster'),
-            geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10
+            geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10, tileScale=4
         ).getInfo()
 
         groups = grouped.get('groups', [])

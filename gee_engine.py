@@ -444,7 +444,7 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
         area_img = ee.Image.pixelArea().addBands(classified)
         grouped = area_img.reduceRegion(
             reducer=ee.Reducer.sum().group(groupField=1, groupName='cls'),
-            geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10
+            geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10, tileScale=4
         ).getInfo()
         class_ha = {-1: 0.0, 0: 0.0, 1: 0.0}
         for g in grouped.get('groups', []):
@@ -452,7 +452,7 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
         total_ha = sum(class_ha.values()) or 1
 
         mean_stats = ee.Image.cat([val1.rename('start'), val2.rename('end')]).reduceRegion(
-            reducer=ee.Reducer.mean(), geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e9
+            reducer=ee.Reducer.mean(), geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e9, tileScale=4
         ).getInfo()
         start_mean = mean_stats.get('start')
         end_mean = mean_stats.get('end')
@@ -461,17 +461,25 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
             overall_change_pct = round((end_mean - start_mean) / abs(start_mean) * 100, 1)
 
         # ── Hotspot detection — zones of largest significant change ──
+        # connectedComponents + reduceToVectors are the two most memory-
+        # hungry operations Earth Engine offers ("User memory limit
+        # exceeded" was happening right here). Fixed with a deliberately
+        # coarser scale just for this step (hotspot zones don't need
+        # pixel-perfect boundaries) plus tileScale, which tells Earth
+        # Engine to split the work into smaller pieces instead of
+        # holding it all in memory at once.
         hotspots = []
         try:
+            hotspot_scale = max(effective_scale * 3, native_scale * 3)
             sig_mask = diff.abs().gt(sig_threshold).selfMask()
-            labeled = sig_mask.connectedComponents(connectedness=ee.Kernel.plus(1), maxSize=1024)
+            labeled = sig_mask.connectedComponents(connectedness=ee.Kernel.plus(1), maxSize=256)
             zones_fc = labeled.select('labels').reduceToVectors(
-                geometry=roi, scale=effective_scale, geometryType='polygon',
-                maxPixels=1e10, bestEffort=True, labelProperty='zone_id'
+                geometry=roi, scale=hotspot_scale, geometryType='polygon',
+                maxPixels=1e9, bestEffort=True, labelProperty='zone_id', tileScale=8
             )
             zones_fc = zones_fc.map(lambda f: f.set('area_ha', f.geometry().area(1).divide(10000)))
             zones_fc = zones_fc.sort('area_ha', False).limit(8)
-            zone_stats_fc = diff.reduceRegions(collection=zones_fc, reducer=ee.Reducer.mean(), scale=effective_scale)
+            zone_stats_fc = diff.reduceRegions(collection=zones_fc, reducer=ee.Reducer.mean(), scale=hotspot_scale, tileScale=4)
 
             letters = 'ABCDEFGH'
             raw_zones = []

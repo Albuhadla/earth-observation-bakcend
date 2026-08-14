@@ -127,6 +127,25 @@ def enterprise_required(f):
     return wrapper
 
 
+def pro_or_higher_required(f):
+    """
+    AI report generation makes a real, billed API call per request —
+    kept off the Basic plan for cost-control reasons, available on
+    Pro and Enterprise.
+    """
+    import functools
+    @functools.wraps(f)
+    def wrapper(user, *args, **kwargs):
+        if not user.has_access():
+            return jsonify({'error': 'Your trial or subscription has ended. Please subscribe to continue.',
+                             'code': 'SUBSCRIPTION_REQUIRED'}), 402
+        if user.plan not in ('pro', 'enterprise'):
+            return jsonify({'error': 'AI-generated analysis requires the Pro or Enterprise plan.',
+                             'code': 'PRO_REQUIRED'}), 402
+        return f(user, *args, **kwargs)
+    return wrapper
+
+
 @app.route('/api/health')
 def health():
     # Actually attempt initialisation here (not just check the package
@@ -184,6 +203,37 @@ def analysis_changemap(user):
         return jsonify({'error': 'Region needs at least 3 points.'}), 400
 
     result = gee_engine.run_change_map(family, index_v, start1, end1, start2, end2, coords)
+    if 'error' in result:
+        return jsonify(result), 422
+    return jsonify(result)
+
+
+@app.route('/api/ai/report', methods=['POST'])
+@token_required
+@pro_or_higher_required
+@rate_limit('20 per hour')
+def ai_report(user):
+    """
+    Generates a detailed AI description of each calculation plus a
+    holistic synthesis across all of them. Isolated import so a
+    problem here (missing package, bad API key) can never break the
+    rest of the app — it just returns a clear error for this one route.
+    """
+    try:
+        import ai_engine
+    except Exception as e:
+        return jsonify({'error': f'AI module failed to load: {e}'}), 500
+
+    d = request.get_json()
+    readings = d.get('readings', [])
+    location = d.get('location')
+    change_map = d.get('change_map')
+    trend = d.get('trend')
+
+    if not readings:
+        return jsonify({'error': 'No calculations to describe — take at least one reading first.'}), 400
+
+    result = ai_engine.generate_ai_report(readings, location, change_map, trend)
     if 'error' in result:
         return jsonify(result), 422
     return jsonify(result)

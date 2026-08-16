@@ -473,6 +473,20 @@ def get_composite_and_index(family, index_v, roi, start_date, end_date):
         return None, None, 0
 
 
+def true_color_vis(composite, family):
+    """
+    Renders a true-colour RGB view of whichever composite came back —
+    Sentinel-2 uses its raw band names, the merged multi-mission
+    Landsat archive uses the logical names (red/green/blue) we
+    remapped everything to. Works regardless of which sensor actually
+    produced the image.
+    """
+    if family in ('water', 'veg'):
+        return composite.visualize(bands=['B4', 'B3', 'B2'], min=0, max=0.3, gamma=1.2)
+    else:  # landsat, geo, urban/ubndbi — merged Landsat archive, logical band names
+        return composite.visualize(bands=['red', 'green', 'blue'], min=0, max=0.3, gamma=1.2)
+
+
 def run_change_map(family, index_v, start1, end1, start2, end2, coords):
     """
     Compares the same index across two periods pixel-by-pixel. Returns
@@ -598,9 +612,26 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
         except Exception as e:
             logger.warning(f'Change map thumbnail failed: {e}')
 
+        # Real before/after true-colour photos — this is what actually
+        # answers "show me the exact thing that changed" (bare land in
+        # 2020, buildings in 2025), rather than only the abstract
+        # increase/stable/decrease classification map above, which
+        # reads as a diffuse, unclear "fog" on its own without the two
+        # real reference photos alongside it.
+        before_thumb_url = None
+        after_thumb_url = None
+        try:
+            before_thumb_url = true_color_vis(composite1, family).clip(roi).getThumbURL(
+                {'region': roi, 'dimensions': dims, 'format': 'png'})
+            after_thumb_url = true_color_vis(composite2, family).clip(roi).getThumbURL(
+                {'region': roi, 'dimensions': dims, 'format': 'png'})
+        except Exception as e:
+            logger.warning(f'Change map before/after thumbnail failed: {e}')
+
         return {
             'source': 'gee_live',
             'images_period1': count1, 'images_period2': count2,
+            'before_thumb_url': before_thumb_url, 'after_thumb_url': after_thumb_url,
             'start_mean': round(start_mean, 4) if start_mean is not None else None,
             'end_mean': round(end_mean, 4) if end_mean is not None else None,
             'overall_change_pct': overall_change_pct,
@@ -979,10 +1010,16 @@ def run_water_bodies(start_date, end_date, coords):
 
 def run_land_classify(start_date, end_date, coords, n_clusters=5):
     """
-    Unsupervised K-Means classification — automatically segments any
-    region into distinct land cover clusters (water, vegetation,
-    bare soil, built-up, etc.) without needing labelled training data.
-    Reports the area each cluster covers.
+    Unsupervised K-Means classification, followed by automatic class
+    identification — each cluster's real spectral signature (mean
+    NDVI, NDWI, NDBI, and brightness) is compared against standard
+    remote-sensing thresholds for water, vegetation, built-up, sand,
+    and bare soil, so results read as "Water" and "Vegetation / Trees"
+    instead of generic "Class 1" / "Class 2". This is a well-
+    established post-classification labelling technique, not a
+    certified classification — it's a best-guess automatic label,
+    worth a visual sanity-check against the true-colour image
+    alongside it, same honesty standard as the rest of the platform.
     """
     if not (EE_AVAILABLE and init_ee()):
         return _simulate_advanced('landClassify', coords)
@@ -1003,33 +1040,76 @@ def run_land_classify(start_date, end_date, coords, n_clusters=5):
         )
         clusterer = ee.Clusterer.wekaKMeans(n_clusters).train(training)
         classified = composite.select(bands).cluster(clusterer)
+        cluster_band = classified.rename('cluster')
 
-        # Adapt scale to region size — the training sample stays fixed
-        # (5000 points regardless of area), but the area-per-class
-        # reduction over the full region needs this to stay fast on
-        # large regions.
         roi_area_m2 = roi.area(1).getInfo()
         effective_scale = compute_adaptive_scale(roi_area_m2, 10, target_pixels=3_000_000)
 
-        area_img = ee.Image.pixelArea().addBands(classified.rename('cluster'))
+        area_img = ee.Image.pixelArea().addBands(cluster_band)
         grouped = area_img.reduceRegion(
             reducer=ee.Reducer.sum().group(groupField=1, groupName='cluster'),
             geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10, tileScale=4
         ).getInfo()
-
         groups = grouped.get('groups', [])
         total_area = sum(g['sum'] for g in groups) or 1
-        classes = sorted(
-            [{'id': int(g['cluster']), 'area_ha': round(g['sum']/10000, 2),
-              'pct': round(g['sum']/total_area*100, 1)} for g in groups],
-            key=lambda c: -c['area_ha']
-        )
+        area_by_cluster = {int(g['cluster']): g['sum'] for g in groups}
 
+        # Real spectral signature per cluster — this is what actually
+        # identifies what each cluster represents, rather than leaving
+        # it as an arbitrary numbered label.
+        ndvi = composite.normalizedDifference(['B8', 'B4'])
+        ndwi = composite.normalizedDifference(['B3', 'B8'])
+        ndbi = composite.normalizedDifference(['B11', 'B8'])
+        brightness = composite.select(['B2', 'B3', 'B4']).reduce(ee.Reducer.mean())
+
+        def grouped_mean(value_img):
+            stacked = value_img.rename('val').addBands(cluster_band)
+            result = stacked.reduceRegion(
+                reducer=ee.Reducer.mean().group(groupField=1, groupName='cluster'),
+                geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e10, tileScale=4
+            ).getInfo()
+            return {int(g['cluster']): g['mean'] for g in result.get('groups', [])}
+
+        ndvi_by_cluster = grouped_mean(ndvi)
+        ndwi_by_cluster = grouped_mean(ndwi)
+        ndbi_by_cluster = grouped_mean(ndbi)
+        bright_by_cluster = grouped_mean(brightness)
+
+        def identify_class(cid):
+            v_ndvi = ndvi_by_cluster.get(cid, 0) or 0
+            v_ndwi = ndwi_by_cluster.get(cid, 0) or 0
+            v_ndbi = ndbi_by_cluster.get(cid, 0) or 0
+            v_bright = bright_by_cluster.get(cid, 0) or 0
+            if v_ndwi > 0.1:
+                return 'Water', '3182bd'
+            if v_ndvi > 0.35:
+                return 'Vegetation / Trees', '31a354'
+            if v_bright > 0.28 and v_ndvi < 0.15:
+                return 'Sand / Bare desert', 'e6d8ad'
+            if v_ndbi > 0.0 and v_bright > 0.15:
+                return 'Buildings / Urban', '969696'
+            return 'Bare land / Soil', 'a87c4f'
+
+        classes = []
+        for cid, area_m2 in area_by_cluster.items():
+            label, color = identify_class(cid)
+            classes.append({
+                'id': cid, 'label': label, 'color': color,
+                'area_ha': round(area_m2 / 10000, 2),
+                'pct': round(area_m2 / total_area * 100, 1),
+            })
+        classes.sort(key=lambda c: -c['area_ha'])
+
+        # Visualisation uses each cluster's IDENTIFIED colour, so the
+        # rendered map and the legend/table actually agree with each
+        # other — instead of an arbitrary rainbow palette by cluster
+        # index that has no relationship to what's on the ground.
         dims = compute_optimal_dimensions(roi, 10)
         thumb_url = None
         try:
-            palette = ['3288bd','66c2a5','abdda4','fee08b','fdae61','d53e4f','9e0142','5e4fa2','f46d43','e6f598']
-            vis = classified.visualize(min=0, max=n_clusters-1, palette=palette[:n_clusters])
+            palette_by_id = {c['id']: c['color'] for c in classes}
+            ordered_palette = [palette_by_id.get(i, 'cccccc') for i in range(n_clusters)]
+            vis = classified.visualize(min=0, max=n_clusters - 1, palette=ordered_palette)
             thumb_url = vis.clip(roi).getThumbURL({'region': roi, 'dimensions': dims, 'format': 'png'})
         except Exception as e:
             logger.warning(f'Land classify thumbnail failed: {e}')
@@ -1058,7 +1138,12 @@ def _simulate_advanced(tool, coords, real_error=None):
         count = rng.randint(5, 400)
         return {'tool':'waterBodies','source':'simulated','images':rng.randint(10,40),
                 'count':count, 'total_water_ha':round(count*rng.uniform(2,40),2), 'note':note}
-    classes = [{'id':i,'area_ha':round(rng.uniform(50,2000),2),'pct':0} for i in range(5)]
+    demo_classes = [
+        ('Vegetation / Trees', '31a354'), ('Water', '3182bd'), ('Buildings / Urban', '969696'),
+        ('Bare land / Soil', 'a87c4f'), ('Sand / Bare desert', 'e6d8ad'),
+    ]
+    classes = [{'id':i, 'label':lbl, 'color':clr, 'area_ha':round(rng.uniform(50,2000),2), 'pct':0}
+               for i,(lbl,clr) in enumerate(demo_classes)]
     total = sum(c['area_ha'] for c in classes) or 1
     for c in classes: c['pct'] = round(c['area_ha']/total*100,1)
     return {'tool':'landClassify','source':'simulated','images':rng.randint(10,40),

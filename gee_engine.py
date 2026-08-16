@@ -120,10 +120,10 @@ PALETTES = {
 # True/false-colour Landsat combos have no single "value" band — these show
 # the actual composite bands directly instead of a palette ramp.
 RGB_VIS = {
-    'natural':  {'bands':['SR_B4','SR_B3','SR_B2'], 'min':0, 'max':0.3, 'gamma':1.2},
-    'falseveg': {'bands':['SR_B5','SR_B4','SR_B3'], 'min':0, 'max':0.4},
-    'urban':    {'bands':['SR_B7','SR_B6','SR_B4'], 'min':0, 'max':0.4},
-    'agri':     {'bands':['SR_B6','SR_B5','SR_B2'], 'min':0, 'max':0.4},
+    'natural':  {'bands':['red','green','blue'], 'min':0, 'max':0.3, 'gamma':1.2},
+    'falseveg': {'bands':['nir','red','green'], 'min':0, 'max':0.4},
+    'urban':    {'bands':['swir2','swir1','red'], 'min':0, 'max':0.4},
+    'agri':     {'bands':['swir1','nir','blue'], 'min':0, 'max':0.4},
     # Sentinel-2 true colour — 10m native resolution vs Landsat's 30m,
     # roughly 3x sharper for spotting individual streets/buildings.
     's2rgb':    {'bands':['B4','B3','B2'], 'min':0, 'max':0.3, 'gamma':1.2},
@@ -240,6 +240,77 @@ def mask_l9(image):
     return image.updateMask(clear).multiply(0.0000275).add(-0.2).copyProperties(image, ['system:time_start'])
 
 
+# ══════════════════════════════════════════════════════════════
+# MULTI-MISSION LANDSAT ARCHIVE — 1984 to present
+# ══════════════════════════════════════════════════════════════
+# Landsat 5, 7, 8, and 9 use DIFFERENT band numbers for the same
+# physical wavelength — e.g. Landsat 5/7's "SR_B4" is near-infrared,
+# but Landsat 8/9's "SR_B4" is red. Naively swapping in older Landsat
+# missions without remapping bands would silently corrupt every index
+# computed from them (this is the exact class of bug behind the
+# impossible NDVI/TSS values found in an earlier academic dissertation
+# on this exact lake — a missing/incorrect band or scale mapping
+# across sensor generations). Every image below is remapped to a
+# common logical naming (blue/green/red/nir/swir1/swir2) and scaled
+# with the same Collection 2 Level 2 formula BEFORE any index formula
+# ever touches it, so the same formula code is always correct
+# regardless of which satellite the image came from.
+LANDSAT_MISSIONS = [
+    # (collection id, mission start, mission end or None, band map)
+    ('LANDSAT/LT05/C02/T1_L2', '1984-03-01', '2013-01-05',
+     {'blue': 'SR_B1', 'green': 'SR_B2', 'red': 'SR_B3', 'nir': 'SR_B4', 'swir1': 'SR_B5', 'swir2': 'SR_B7', 'qa': 'QA_PIXEL'}),
+    ('LANDSAT/LE07/C02/T1_L2', '1999-04-15', None,
+     {'blue': 'SR_B1', 'green': 'SR_B2', 'red': 'SR_B3', 'nir': 'SR_B4', 'swir1': 'SR_B5', 'swir2': 'SR_B7', 'qa': 'QA_PIXEL'}),
+    ('LANDSAT/LC08/C02/T1_L2', '2013-04-11', None,
+     {'blue': 'SR_B2', 'green': 'SR_B3', 'red': 'SR_B4', 'nir': 'SR_B5', 'swir1': 'SR_B6', 'swir2': 'SR_B7', 'qa': 'QA_PIXEL'}),
+    ('LANDSAT/LC09/C02/T1_L2', '2021-10-31', None,
+     {'blue': 'SR_B2', 'green': 'SR_B3', 'red': 'SR_B4', 'nir': 'SR_B5', 'swir1': 'SR_B6', 'swir2': 'SR_B7', 'qa': 'QA_PIXEL'}),
+]
+
+
+def mask_landsat_generic(image, band_map):
+    """
+    Cloud-masks, applies the standard Collection 2 Level-2 scale
+    factor (identical formula across every Landsat mission, so this
+    part alone was never the risk), and — the actual fix — renames
+    each sensor's differently-numbered bands to common logical names
+    so every index formula downstream is automatically correct no
+    matter which satellite generation the pixel came from.
+    """
+    qa = image.select(band_map['qa'])
+    clear = qa.bitwiseAnd(1 << 3).eq(0).And(qa.bitwiseAnd(1 << 4).eq(0))
+    renamed = image.select(
+        [band_map['blue'], band_map['green'], band_map['red'], band_map['nir'], band_map['swir1'], band_map['swir2']],
+        ['blue', 'green', 'red', 'nir', 'swir1', 'swir2']
+    )
+    scaled = renamed.updateMask(clear).multiply(0.0000275).add(-0.2)
+    return scaled.copyProperties(image, ['system:time_start'])
+
+
+def get_landsat_collection(roi, start_date, end_date):
+    """
+    Merges every Landsat mission whose operational lifetime overlaps
+    the requested date range into one collection, bands already
+    remapped to common logical names. This is what actually extends
+    the usable archive back to 1984 instead of being capped at
+    Landsat 9's 2021 launch — the same date range that used to return
+    "no images" for anything before Sep 2021 now pulls from whichever
+    real satellite was actually operating at that time.
+    """
+    merged = None
+    for coll_id, mission_start, mission_end, band_map in LANDSAT_MISSIONS:
+        if mission_end and start_date > mission_end:
+            continue
+        if end_date < mission_start:
+            continue
+        coll = (ee.ImageCollection(coll_id)
+                .filterBounds(roi).filterDate(start_date, end_date)
+                .filter(ee.Filter.lt('CLOUD_COVER', 30))
+                .map(lambda img, bm=band_map: mask_landsat_generic(img, bm)))
+        merged = coll if merged is None else merged.merge(coll)
+    return merged
+
+
 def roi_from_coords(coords):
     """coords: [[lat,lng], ...] from the frontend."""
     ring = [[c[1], c[0]] for c in coords]  # to [lng,lat]
@@ -268,32 +339,35 @@ def water_index_image(s2, index_v):
     return s2.normalizedDifference(['B3', 'B8']).rename('value')
 
 
-def landsat_combo_image(l9, index_v):
+def landsat_combo_image(image, index_v):
+    # Uses logical band names (blue/green/red/nir/swir1/swir2) — correct
+    # automatically regardless of which Landsat mission the composite
+    # came from, since get_landsat_collection() already remapped them.
     if index_v == 'ndvi':
-        return l9.normalizedDifference(['SR_B5', 'SR_B4']).rename('value')
+        return image.normalizedDifference(['nir', 'red']).rename('value')
     if index_v == 'mndwi':
-        return l9.normalizedDifference(['SR_B3', 'SR_B6']).rename('value')
+        return image.normalizedDifference(['green', 'swir1']).rename('value')
     if index_v == 'ndbi':
-        return l9.normalizedDifference(['SR_B6', 'SR_B5']).rename('value')
+        return image.normalizedDifference(['swir1', 'nir']).rename('value')
     # RGB-style combos have no single "value" band — return NDVI as the stat proxy
-    return l9.normalizedDifference(['SR_B5', 'SR_B4']).rename('value')
+    return image.normalizedDifference(['nir', 'red']).rename('value')
 
 
-def geology_image(l9, index_v):
-    ndwi = l9.normalizedDifference(['SR_B3', 'SR_B5'])
+def geology_image(image, index_v):
+    ndwi = image.normalizedDifference(['green', 'nir'])
     land_mask = ndwi.lt(0.0)
-    B2,B3,B4,B5,B6,B7 = [l9.select(b) for b in ['SR_B2','SR_B3','SR_B4','SR_B5','SR_B6','SR_B7']]
+    blue, green, red, nir, swir1, swir2 = [image.select(b) for b in ['blue', 'green', 'red', 'nir', 'swir1', 'swir2']]
     if index_v == 'iron':
-        img = B4.divide(B2.max(0.0001))
+        img = red.divide(blue.max(0.0001))
     elif index_v == 'clay':
-        img = B6.divide(B7.max(0.0001))
+        img = swir1.divide(swir2.max(0.0001))
     elif index_v == 'carbonate':
-        img = B6.divide(B7.add(B4).max(0.0001))
+        img = swir1.divide(swir2.add(red).max(0.0001))
     elif index_v == 'evaporite':
-        img = B2.add(B3).add(B4).divide(3).multiply(B6.divide(B7.max(0.0001)))
+        img = blue.add(green).add(red).divide(3).multiply(swir1.divide(swir2.max(0.0001)))
     else:  # allmin
-        iron, clay, carb, sil = B4.divide(B2.max(0.0001)), B6.divide(B7.max(0.0001)), \
-                                 B6.divide(B7.add(B4).max(0.0001)), B5.divide(B6.max(0.0001))
+        iron, clay, carb, sil = red.divide(blue.max(0.0001)), swir1.divide(swir2.max(0.0001)), \
+                                 swir1.divide(swir2.add(red).max(0.0001)), nir.divide(swir1.max(0.0001))
         img = iron.multiply(0.3).add(clay.multiply(0.25)).add(carb.multiply(0.25)).add(sil.multiply(0.2))
     return img.rename('value').updateMask(land_mask)
 
@@ -354,21 +428,17 @@ def get_composite_and_index(family, index_v, roi, start_date, end_date):
         elif family == 'landsat':
             if index_v not in ('ndvi', 'mndwi', 'ndbi'):
                 return None, None, 0  # RGB combos have no single comparable value
-            coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
-                    .filterBounds(roi).filterDate(start_date, end_date)
-                    .filter(ee.Filter.lt('CLOUD_COVER', 30)))
-            count = coll.size().getInfo()
+            coll = get_landsat_collection(roi, start_date, end_date)
+            count = coll.size().getInfo() if coll is not None else 0
             if count == 0: return None, None, 0
-            composite = coll.map(mask_l9).median().clip(roi)
+            composite = coll.median().clip(roi)
             return composite, landsat_combo_image(composite, index_v), count
 
         elif family == 'geo':
-            coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
-                    .filterBounds(roi).filterDate(start_date, end_date)
-                    .filter(ee.Filter.lt('CLOUD_COVER', 30)))
-            count = coll.size().getInfo()
+            coll = get_landsat_collection(roi, start_date, end_date)
+            count = coll.size().getInfo() if coll is not None else 0
             if count == 0: return None, None, 0
-            composite = coll.map(mask_l9).median().clip(roi)
+            composite = coll.median().clip(roi)
             return composite, geology_image(composite, index_v), count
 
         elif family == 'veg':
@@ -389,13 +459,11 @@ def get_composite_and_index(family, index_v, roi, start_date, end_date):
                 composite = coll.select('avg_rad').median().clip(roi)
                 return composite, composite.max(0).rename('value'), count
             elif index_v == 'ubndbi':
-                coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
-                        .filterBounds(roi).filterDate(start_date, end_date)
-                        .filter(ee.Filter.lt('CLOUD_COVER', 30)))
-                count = coll.size().getInfo()
+                coll = get_landsat_collection(roi, start_date, end_date)
+                count = coll.size().getInfo() if coll is not None else 0
                 if count == 0: return None, None, 0
-                composite = coll.map(mask_l9).median().clip(roi)
-                return composite, composite.normalizedDifference(['SR_B6', 'SR_B5']).rename('value'), count
+                composite = coll.median().clip(roi)
+                return composite, composite.normalizedDifference(['swir1', 'nir']).rename('value'), count
             else:
                 return None, None, 0  # s2rgb — true colour, no single value
         else:
@@ -564,22 +632,18 @@ def run_reading(family, index_v, start_date, end_date, coords):
             scale = 30
 
         elif family == 'landsat':
-            coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
-                    .filterBounds(roi).filterDate(start_date, end_date)
-                    .filter(ee.Filter.lt('CLOUD_COVER', 30)))
-            count = coll.size().getInfo()
-            if count == 0: return {'error': 'No Landsat 9 images for this period/region (launched Sep 2021).'}
-            composite = coll.map(mask_l9).median().clip(roi)
+            coll = get_landsat_collection(roi, start_date, end_date)
+            count = coll.size().getInfo() if coll is not None else 0
+            if count == 0: return {'error': 'No Landsat imagery for this period/region (Landsat archive covers 1984–present).'}
+            composite = coll.median().clip(roi)
             img = landsat_combo_image(composite, index_v)
             scale = 30
 
         elif family == 'geo':
-            coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
-                    .filterBounds(roi).filterDate(start_date, end_date)
-                    .filter(ee.Filter.lt('CLOUD_COVER', 30)))
-            count = coll.size().getInfo()
-            if count == 0: return {'error': 'No Landsat 9 images for this period/region.'}
-            composite = coll.map(mask_l9).median().clip(roi)
+            coll = get_landsat_collection(roi, start_date, end_date)
+            count = coll.size().getInfo() if coll is not None else 0
+            if count == 0: return {'error': 'No Landsat imagery for this period/region (Landsat archive covers 1984–present).'}
+            composite = coll.median().clip(roi)
             img = geology_image(composite, index_v)
             scale = 30
 
@@ -626,13 +690,11 @@ def run_reading(family, index_v, start_date, end_date, coords):
                 scale = 10
 
             else:  # 'ubndbi' — built-up index, same math as Landsat NDBI
-                coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
-                        .filterBounds(roi).filterDate(start_date, end_date)
-                        .filter(ee.Filter.lt('CLOUD_COVER', 30)))
-                count = coll.size().getInfo()
-                if count == 0: return {'error': 'No Landsat 9 images for this period/region (launched Sep 2021).'}
-                composite = coll.map(mask_l9).median().clip(roi)
-                img = composite.normalizedDifference(['SR_B6','SR_B5']).rename('value')
+                coll = get_landsat_collection(roi, start_date, end_date)
+                count = coll.size().getInfo() if coll is not None else 0
+                if count == 0: return {'error': 'No Landsat imagery for this period/region (Landsat archive covers 1984–present).'}
+                composite = coll.median().clip(roi)
+                img = composite.normalizedDifference(['swir1', 'nir']).rename('value')
                 scale = 30
 
         elif family == 'archaeology':
@@ -956,28 +1018,34 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
         roi = roi_from_coords(coords)
 
         # Urban and archaeology families span multiple different
-        # collections depending on which index was picked.
-        if family == 'urban':
+        # collections depending on which index was picked. Landsat-based
+        # families (landsat, geo, urban/ubndbi) now use the merged
+        # multi-mission archive so a trend chart can span decades, not
+        # just since Landsat 9 launched in 2021.
+        is_multi_landsat = (family in ('landsat', 'geo')) or (family == 'urban' and index_v == 'ubndbi')
+
+        if is_multi_landsat:
+            coll = get_landsat_collection(roi, start_date, end_date)
+        elif family == 'urban':
             if index_v == 'nightlights':
                 coll_id = 'NOAA/VIIRS/DNB/MONTHLY_V1/VCMSLCFG'
-            elif index_v == 's2rgb':
+            else:  # s2rgb
                 coll_id = 'COPERNICUS/S2_SR_HARMONIZED'
-            else:
-                coll_id = 'LANDSAT/LC09/C02/T1_L2'
+            coll = ee.ImageCollection(coll_id).filterBounds(roi).filterDate(start_date, end_date)
+            if 'S2' in coll_id:
+                coll = coll.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
         elif family == 'archaeology':
             coll_id = 'COPERNICUS/S1_GRD' if index_v == 'sar' else 'COPERNICUS/S2_SR_HARMONIZED'
-        else:
-            coll_id = 'COPERNICUS/S2_SR_HARMONIZED' if family in ('water','veg') else 'LANDSAT/LC09/C02/T1_L2'
-
-        coll = ee.ImageCollection(coll_id).filterBounds(roi).filterDate(start_date, end_date)
-        if coll_id == 'COPERNICUS/S1_GRD':
-            coll = (coll.filter(ee.Filter.eq('instrumentMode', 'IW'))
-                        .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV')))
-        elif 'S2' in coll_id:
-            coll = coll.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
-        elif 'LANDSAT' in coll_id:
-            coll = coll.filter(ee.Filter.lt('CLOUD_COVER', 30))
-        # VIIRS needs no cloud filter — it's a pre-composited monthly product
+            coll = ee.ImageCollection(coll_id).filterBounds(roi).filterDate(start_date, end_date)
+            if coll_id == 'COPERNICUS/S1_GRD':
+                coll = (coll.filter(ee.Filter.eq('instrumentMode', 'IW'))
+                            .filter(ee.Filter.listContains('transmitterReceiverPolarisation', 'VV')))
+            else:
+                coll = coll.filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+        else:  # water, veg — Sentinel-2 only
+            coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                    .filterBounds(roi).filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40)))
 
         start = ee.Date(start_date); end = ee.Date(end_date)
         n_months = end.difference(start, 'month').round()
@@ -995,21 +1063,25 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
                 composite = imgs.map(mask_s2).median()
                 ndvi = composite.normalizedDifference(['B8','B4'])
                 idx = ndvi.subtract(ndvi.focalMean(radius=30, units='meters')).rename('value')
-            else:
-                masked = imgs.map(mask_s2 if 'S2' in coll_id else mask_l9)
-                composite = masked.median()
-                if family == 'water':
-                    idx = water_index_image(composite, index_v)
-                elif family == 'landsat':
+            elif is_multi_landsat:
+                # Already cloud-masked, scaled, and band-remapped by
+                # get_landsat_collection() — no further masking needed here.
+                composite = imgs.median()
+                if family == 'landsat':
                     idx = landsat_combo_image(composite, index_v)
                 elif family == 'geo':
                     idx = geology_image(composite, index_v)
+                else:  # urban / ubndbi
+                    idx = composite.normalizedDifference(['swir1', 'nir']).rename('value')
+            else:
+                masked = imgs.map(mask_s2)
+                composite = masked.median()
+                if family == 'water':
+                    idx = water_index_image(composite, index_v)
                 elif family == 'veg':
                     idx = vegetation_image(composite, index_v)
-                elif family == 'urban' and index_v == 's2rgb':
+                else:  # urban / s2rgb
                     idx = composite.normalizedDifference(['B8','B4']).rename('value')
-                else:  # urban / ubndbi
-                    idx = composite.normalizedDifference(['SR_B6','SR_B5']).rename('value')
 
             scale = 500 if (family=='urban' and index_v=='nightlights') else 100
             val = idx.select('value').reduceRegion(ee.Reducer.mean(), roi, scale, bestEffort=True).get('value')

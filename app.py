@@ -12,13 +12,13 @@ Earth Observation and Analysis — Backend
   POST /api/analysis/timeseries  Monthly trend (subscription required)
   GET  /api/analysis/history     This user's saved readings
 """
-import os, logging
+import os, logging, json
 from datetime import datetime
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-from models import db, User, Reading
+from models import db, User, Reading, SavedLocation, LocationHistory
 from auth import auth_bp, token_required
 from payments import payments_bp
 import gee_engine
@@ -237,6 +237,79 @@ def ai_report(user):
     if 'error' in result:
         return jsonify(result), 422
     return jsonify(result)
+
+
+# ══════════════════════════════════════════════════════════════
+# SAVED LOCATIONS — the foundation for recurring monitoring.
+# A saved location is just persisted region+family+index config;
+# the actual periodic re-checking and anomaly detection are a
+# separate scheduled job, built on top of this.
+# ══════════════════════════════════════════════════════════════
+
+# Locations included per plan — mirrors the same spirit as the
+# family/quota gating already in place for readings. None of this
+# blocks a user from taking normal one-off readings; it only limits
+# how many locations can be under ongoing automatic monitoring.
+PLAN_LOCATION_LIMIT = {'basic': 0, 'pro': 5, 'enterprise': 25}
+
+
+@app.route('/api/locations', methods=['GET'])
+@token_required
+@subscription_required
+def list_locations(user):
+    locations = SavedLocation.query.filter_by(user_id=user.id).order_by(SavedLocation.created_at.desc()).all()
+    return jsonify({'locations': [l.to_dict() for l in locations]})
+
+
+@app.route('/api/locations', methods=['POST'])
+@token_required
+@subscription_required
+@rate_limit('20 per hour')
+def create_location(user):
+    d = request.get_json()
+    name, family, index_v, roi = d.get('name'), d.get('family'), d.get('index'), d.get('roi')
+
+    if not all([name, family, index_v, roi]):
+        return jsonify({'error': 'name, family, index and roi are all required.'}), 400
+    if len(roi) < 3:
+        return jsonify({'error': 'Region needs at least 3 points.'}), 400
+
+    limit = PLAN_LOCATION_LIMIT.get(user.plan, 0)
+    current_count = SavedLocation.query.filter_by(user_id=user.id, active=True).count()
+    if current_count >= limit:
+        return jsonify({
+            'error': f'Your {user.plan.title()} plan includes {limit} monitored location{"s" if limit != 1 else ""}. Upgrade for more, or remove an existing one.',
+            'code': 'LOCATION_LIMIT_REACHED'
+        }), 402
+
+    loc = SavedLocation(
+        user_id=user.id, name=name, family=family, index_name=index_v,
+        roi_geojson=json.dumps(roi), check_frequency=d.get('check_frequency', 'monthly')
+    )
+    db.session.add(loc)
+    db.session.commit()
+    return jsonify(loc.to_dict())
+
+
+@app.route('/api/locations/<int:location_id>', methods=['DELETE'])
+@token_required
+def delete_location(user, location_id):
+    loc = SavedLocation.query.filter_by(id=location_id, user_id=user.id).first()
+    if not loc:
+        return jsonify({'error': 'Location not found.'}), 404
+    db.session.delete(loc)
+    db.session.commit()
+    return jsonify({'deleted': True})
+
+
+@app.route('/api/locations/<int:location_id>/history', methods=['GET'])
+@token_required
+def location_history(user, location_id):
+    loc = SavedLocation.query.filter_by(id=location_id, user_id=user.id).first()
+    if not loc:
+        return jsonify({'error': 'Location not found.'}), 404
+    history = LocationHistory.query.filter_by(location_id=loc.id).order_by(LocationHistory.checked_at.asc()).all()
+    return jsonify({'location': loc.to_dict(), 'history': [h.to_dict() for h in history]})
 
 
 @app.route('/api/analysis/advanced', methods=['POST'])

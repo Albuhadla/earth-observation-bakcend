@@ -559,7 +559,22 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
                 mean_change = props.get('mean')
                 if area_ha < 0.5 or mean_change is None:
                     continue  # skip noise-sized zones
-                raw_zones.append({'area_ha': area_ha, 'mean_change': round(mean_change, 4)})
+
+                # Extract the actual zone boundary so the frontend can draw it
+                # on the map — this was being computed by Earth Engine and then
+                # silently discarded before, which is why hotspot zones were
+                # never actually visible anywhere except as a text table.
+                geom = f.get('geometry') or {}
+                ring_lnglat = geom.get('coordinates', [[]])[0] if geom.get('type') == 'Polygon' else []
+                ring = [[pt[1], pt[0]] for pt in ring_lnglat]  # GeoJSON [lng,lat] -> our [lat,lng] convention
+                centroid = None
+                if ring:
+                    centroid = [sum(p[0] for p in ring) / len(ring), sum(p[1] for p in ring) / len(ring)]
+
+                raw_zones.append({
+                    'area_ha': area_ha, 'mean_change': round(mean_change, 4),
+                    'ring': ring, 'centroid': centroid,
+                })
 
             raw_zones.sort(key=lambda h: -(h['area_ha'] * abs(h['mean_change'])))
             for i, z in enumerate(raw_zones[:5]):
@@ -569,6 +584,7 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
                     'mean_change': z['mean_change'],
                     'direction': 'increase' if z['mean_change'] > 0 else 'decrease',
                     'priority': 'High' if i == 0 else 'Medium' if i == 1 else 'Low',
+                    'ring': z['ring'], 'centroid': z['centroid'],
                 })
         except Exception as e:
             logger.warning(f'Hotspot detection failed (non-fatal, continuing without it): {e}')
@@ -794,11 +810,17 @@ def run_reading(family, index_v, start_date, end_date, coords):
 def run_tree_count(start_date, end_date, coords):
     """
     Counts individual tree/palm crowns within a farm boundary using
-    local-maxima detection on a vegetation index — each isolated peak
-    in greenness corresponds to one tree canopy centre. Works best on
-    mature, moderately-spaced trees (palm/date orchards are a classic
-    fit); very dense or young plantings will under-count since
-    touching crowns merge into a single peak.
+    multi-pass local-maxima detection on a vegetation index — each
+    isolated peak in greenness corresponds to one tree canopy centre.
+
+    A single fixed search radius systematically misses smaller/younger
+    trees near a larger one, since Earth Engine correctly identifies
+    only the single tallest peak within that radius — smaller
+    neighbours get suppressed, not missed by accident. This runs a
+    second pass: detect large/mature trees first, mask out their own
+    footprint, then re-detect on what's left — freeing up smaller
+    trees that were previously being overshadowed by a bigger
+    neighbour to become local maxima of their own right.
     """
     if not (EE_AVAILABLE and init_ee()):
         return _simulate_advanced('treeCount', coords)
@@ -815,12 +837,29 @@ def run_tree_count(start_date, end_date, coords):
         composite = coll.map(mask_s2).median().clip(roi)
         ndvi = composite.normalizedDifference(['B8', 'B4'])
 
-        # Local-maxima peak detection — a pixel is a tree centre if it's
-        # the brightest (greenest) pixel within its neighbourhood AND
-        # actually vegetated (excludes bare-soil/noise local maxima).
-        kernel = ee.Kernel.circle(radius=1, units='pixels')  # ~10m — typical mature palm spacing
-        local_max = ndvi.focalMax(kernel=kernel)
-        peaks = ndvi.eq(local_max).And(ndvi.gt(0.35)).selfMask()
+        # Pass 1 — large/mature trees, wider search radius.
+        kernel_large = ee.Kernel.circle(radius=1, units='pixels')  # ~10m
+        large_local_max = ndvi.focalMax(kernel=kernel_large)
+        large_peaks = ndvi.eq(large_local_max).And(ndvi.gt(0.45))
+
+        # Mask out the footprint immediately around each large-tree
+        # detection before searching for smaller trees, so a mature
+        # tree's own crown can't get double-counted as several small
+        # ones, and so a genuinely separate small tree right next to
+        # it is no longer shadowed by the bigger tree's peak.
+        exclusion = large_peaks.focalMax(kernel=ee.Kernel.circle(radius=1, units='pixels'))
+        remaining_ndvi = ndvi.updateMask(exclusion.Not())
+
+        # Pass 2 — small/young trees, on whatever's left. Slightly
+        # relaxed vegetation threshold, since younger canopies read
+        # less densely green than mature ones.
+        small_local_max = remaining_ndvi.focalMax(kernel=ee.Kernel.circle(radius=1, units='pixels'))
+        small_peaks = remaining_ndvi.eq(small_local_max).And(remaining_ndvi.gt(0.30)).unmask(0)
+
+        peaks = large_peaks.Or(small_peaks).selfMask()
+        # Keep the underlying NDVI value at each detected peak — this is
+        # what the size/vigour categorisation below groups by.
+        peak_ndvi = ndvi.updateMask(peaks)
 
         area_ha = ee.Number(roi.area(1)).divide(10000)
         tree_count = peaks.reduceRegion(
@@ -830,6 +869,27 @@ def run_tree_count(start_date, end_date, coords):
         n_trees = int(tree_count.get('nd', 0) or 0)
         area_ha_val = area_ha.getInfo()
         density = round(n_trees / area_ha_val, 1) if area_ha_val > 0 else 0
+
+        # Honest categorisation by canopy size/vigour (from NDVI peak
+        # intensity) — NOT species identification. True species-level
+        # classification needs hyperspectral imagery or region-specific
+        # labelled training samples, neither of which free 10m
+        # Sentinel-2 data can provide. This groups detected trees into
+        # Large/mature, Medium, and Small/young canopy categories,
+        # which is a genuinely different and useful signal (e.g.
+        # spotting a young replanting block vs. an established grove)
+        # without overclaiming what the data can actually support.
+        size_categories = {}
+        try:
+            for label, lo, hi in [('large_mature', 0.6, 2), ('medium', 0.45, 0.6), ('small_young', 0.0, 0.45)]:
+                bucket_mask = peak_ndvi.gte(lo).And(peak_ndvi.lt(hi))
+                bucket_count = bucket_mask.selfMask().reduceRegion(
+                    reducer=ee.Reducer.count(), geometry=roi, scale=10,
+                    bestEffort=True, maxPixels=1e9, tileScale=4
+                ).getInfo()
+                size_categories[label] = int(bucket_count.get('nd', 0) or 0)
+        except Exception as e:
+            logger.warning(f'Tree size categorisation failed (non-fatal): {e}')
 
         # Visual: true-colour base with detected tree centres highlighted
         dims = compute_optimal_dimensions(roi, 10)
@@ -845,6 +905,7 @@ def run_tree_count(start_date, end_date, coords):
         return {
             'tool': 'treeCount', 'source': 'gee_live', 'images': count_imgs,
             'count': n_trees, 'area_ha': round(area_ha_val, 2), 'density_per_ha': density,
+            'size_categories': size_categories,
             'thumb_url': thumb_url,
         }
     except Exception as e:

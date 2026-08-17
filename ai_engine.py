@@ -140,25 +140,81 @@ Return JSON with exactly this schema:
             model=ANTHROPIC_MODEL,
             max_tokens=2000,
             system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}]
+            messages=[
+                {"role": "user", "content": user_prompt},
+                # Prefilling the assistant's turn with the opening brace is
+                # a reliable way to force Claude to continue directly into
+                # JSON — this is the actual fix for "AI response could not
+                # be parsed", since it prevents the stray preamble sentence
+                # or commentary that was causing that in the first place,
+                # rather than just parsing more defensively after the fact.
+                {"role": "assistant", "content": "{"}
+            ]
         )
 
-        raw_text = "".join(block.text for block in response.content if hasattr(block, 'text'))
+        raw_text = "{" + "".join(block.text for block in response.content if hasattr(block, 'text'))
         raw_text = raw_text.strip()
-        # Guard against the model wrapping in a markdown fence despite instructions
-        if raw_text.startswith('```'):
-            raw_text = raw_text.split('```')[1]
-            if raw_text.startswith('json'):
-                raw_text = raw_text[4:]
 
-        parsed = json.loads(raw_text)
+        parsed = _parse_ai_json(raw_text)
+        if parsed is None:
+            # This is the actual fix — previously this just said "could
+            # not be parsed" with zero information about why, making it
+            # impossible to diagnose without direct server log access.
+            # Now the real raw response (truncated) comes back in the
+            # error itself, and several parsing strategies are tried
+            # before giving up, since a model occasionally adds a stray
+            # preamble sentence or trailing comment even when told not to.
+            snippet = raw_text[:300].replace('\n', ' ')
+            logger.error(f'AI report: could not parse model output. Raw response started with: {snippet}')
+            return {'error': f'AI response could not be parsed. Raw output started with: "{snippet}..." — please try again; if this keeps happening, this snippet is what needs fixing in the prompt.'}
+
         if 'per_calculation' not in parsed or 'synthesis' not in parsed:
-            return {'error': 'AI response was missing expected fields — please try again.'}
+            return {'error': f'AI response was missing expected fields — got keys: {list(parsed.keys())}. Please try again.'}
         return parsed
 
-    except json.JSONDecodeError as e:
-        logger.error(f'AI report: model returned invalid JSON: {e}')
-        return {'error': 'AI response could not be parsed — please try again.'}
     except Exception as e:
         logger.error(f'AI report generation failed: {e}')
         return {'error': f'AI request failed: {e}'}
+
+
+def _parse_ai_json(raw_text):
+    """
+    Tries several increasingly-forgiving strategies to extract valid
+    JSON from a model response, since even an explicit "JSON only, no
+    markdown fences" instruction doesn't always get followed exactly —
+    a stray preamble sentence or a fence wrapper is common enough to
+    be worth handling directly rather than failing outright.
+    Returns the parsed dict, or None if every strategy fails.
+    """
+    text = raw_text.strip()
+
+    # Strategy 1: direct parse — the model followed instructions exactly.
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Strategy 2: strip a markdown code fence, with or without a "json" tag.
+    if '```' in text:
+        parts = text.split('```')
+        for part in parts:
+            candidate = part.strip()
+            if candidate.startswith('json'):
+                candidate = candidate[4:].strip()
+            if candidate.startswith('{'):
+                try:
+                    return json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+
+    # Strategy 3: extract from the first '{' to the last '}' — handles a
+    # stray sentence before or after the actual JSON object.
+    first = text.find('{')
+    last = text.rfind('}')
+    if first != -1 and last != -1 and last > first:
+        try:
+            return json.loads(text[first:last+1])
+        except json.JSONDecodeError:
+            pass
+
+    return None

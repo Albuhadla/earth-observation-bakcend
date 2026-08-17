@@ -208,6 +208,27 @@ def analysis_changemap(user):
     return jsonify(result)
 
 
+@app.route('/api/analysis/waterlevel', methods=['POST'])
+@token_required
+@subscription_required
+@rate_limit('15 per hour')
+def analysis_waterlevel(user):
+    d = request.get_json()
+    start1, end1 = d.get('start1'), d.get('end1')
+    start2, end2 = d.get('start2'), d.get('end2')
+    coords = d.get('roi')
+
+    if not all([start1, end1, start2, end2, coords]):
+        return jsonify({'error': 'start1, end1, start2, end2 and roi are all required.'}), 400
+    if len(coords) < 3:
+        return jsonify({'error': 'Region needs at least 3 points.'}), 400
+
+    result = gee_engine.run_water_level(start1, end1, start2, end2, coords)
+    if 'error' in result:
+        return jsonify(result), 422
+    return jsonify(result)
+
+
 @app.route('/api/ai/report', methods=['POST'])
 @token_required
 @pro_or_higher_required
@@ -229,11 +250,12 @@ def ai_report(user):
     location = d.get('location')
     change_map = d.get('change_map')
     trend = d.get('trend')
+    water_level = d.get('water_level')
 
-    if not readings:
+    if not readings and not water_level:
         return jsonify({'error': 'No calculations to describe — take at least one reading first.'}), 400
 
-    result = ai_engine.generate_ai_report(readings, location, change_map, trend)
+    result = ai_engine.generate_ai_report(readings, location, change_map, trend, water_level)
     if 'error' in result:
         return jsonify(result), 422
     return jsonify(result)

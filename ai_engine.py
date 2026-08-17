@@ -70,7 +70,7 @@ def _classify_confidence(index_v):
     return 'high' if index_v in HIGH_CONFIDENCE_INDICES else 'proxy'
 
 
-def _build_payload(readings, location, change_map, trend):
+def _build_payload(readings, location, change_map, trend, water_level=None):
     """Strips each reading down to only the fields the model should see —
     deliberately not including internal IDs, raw thumbnail URLs, etc."""
     payload = {
@@ -104,10 +104,20 @@ def _build_payload(readings, location, change_map, trend):
             'values': trend.get('data'),
             'stated_slope': trend.get('slopeText'),
         }
+    if water_level:
+        payload['water_level_estimate'] = {
+            'confidence': 'proxy',
+            'method': 'Estimated from Copernicus DEM elevation sampled at the water body\'s shoreline (boundary of the detected water extent) for each period — not direct altimetry.',
+            'period_1': water_level.get('period1'),
+            'period_2': water_level.get('period2'),
+            'level_1_m': water_level.get('level1_m'),
+            'level_2_m': water_level.get('level2_m'),
+            'change_m': water_level.get('change_m'),
+        }
     return payload
 
 
-def generate_ai_report(readings, location, change_map, trend):
+def generate_ai_report(readings, location, change_map, trend, water_level=None):
     """
     Returns {'per_calculation': [{'index':..., 'description':...}, ...],
     'synthesis': '...'} or {'error': '...'} on failure. Never raises —
@@ -120,11 +130,11 @@ def generate_ai_report(readings, location, change_map, trend):
     if not api_key:
         return {'error': 'AI feature not configured on the server (missing API key).'}
 
-    if not readings:
+    if not readings and not water_level:
         return {'error': 'No calculations to describe — take at least one reading first.'}
 
     try:
-        payload = _build_payload(readings, location, change_map, trend)
+        payload = _build_payload(readings, location, change_map, trend, water_level)
 
         user_prompt = f"""Here is the structured data for this session:
 
@@ -160,7 +170,7 @@ Call the generate_report tool with your analysis."""
                     },
                     "synthesis": {
                         "type": "string",
-                        "description": "2-4 paragraph holistic narrative connecting the readings (or a deeper single paragraph if there's only one reading)."
+                        "description": "2-4 paragraph holistic narrative connecting the readings (or a deeper single paragraph if there's only one reading). If water_level_estimate is present in the input, explicitly weave it in — state the estimated change in metres, note it's a PROXY MEASUREMENT (not direct altimetry), and connect it to the other readings where relevant (e.g. does a water level drop align with a water extent decrease?)."
                     }
                 },
                 "required": ["per_calculation", "synthesis"]

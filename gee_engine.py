@@ -83,6 +83,16 @@ RANGES = {
     'slope':       (0, 45),      # degrees — most tell/mound/ditch edges fall in this range
     'vegAnomaly':  (-0.15, 0.15),# NDVI deviation from local neighbourhood average
     'sar':         (-25, 0),     # Sentinel-1 VV backscatter, dB
+    # Fire
+    'nbr':         (-0.2, 0.8),  # Normalized Burn Ratio — healthy veg high, burned scar low/negative
+    'activefire':  (0, 1),       # binary-ish hotspot confidence mask
+    # Heat
+    'lst':         (10, 55),     # Land Surface Temperature, °C — wide to cover desert extremes
+    'sst':         (5, 35),      # Sea Surface Temperature, °C
+    # Pollution (Sentinel-5P units)
+    'no2':         (0, 0.0002),  # mol/m² tropospheric column
+    'so2':         (0, 0.001),   # mol/m² column
+    'aerosol':     (-1, 2),      # UV Aerosol Index, unitless
 }
 
 # Palettes — mirror app.js's FAMILIES[*].items[*].palette exactly, so the
@@ -115,6 +125,13 @@ PALETTES = {
     'slope':     ['1a9850','a6d96a','fee08b','fc8d59','d73027'],
     'vegAnomaly':['8c510a','d8b365','f5f5f5','5ab4ac','01665e'],
     'sar':       ['000000','404040','808080','c0c0c0','ffffff'],
+    'nbr':       ['1a9850','a6d96a','ffffbf','fdae61','a50026','4d0000'],  # green→healthy, dark red→severely burned
+    'activefire':['00000000','ffeb3b','ff8c00','d7191c'],
+    'lst':       ['313695','74add1','ffffbf','fdae61','a50026','4d0000'],
+    'sst':       ['08306b','2171b5','6baed6','c6dbef','fee0d2','fc9272','de2d26'],
+    'no2':       ['ffffff','ffffbf','fdae61','d73027','7f0000'],
+    'so2':       ['ffffff','fee8c8','fdbb84','e34a33','990000'],
+    'aerosol':   ['313695','abd9e9','ffffbf','fdae61','a50026'],
 }
 
 # True/false-colour Landsat combos have no single "value" band — these show
@@ -142,6 +159,8 @@ NATIVE_SCALE = {
     'nightlights':500, 's2rgb':10, 'ubndbi':30,
     'natural':30, 'falseveg':30, 'urban':30, 'agri':30,
     'elevation':30, 'slope':30, 'vegAnomaly':10, 'sar':10,
+    'nbr':10, 'activefire':1000, 'lst':30, 'sst':1000,
+    'no2':1113, 'so2':1113, 'aerosol':1113,  # Sentinel-5P native ~7km, oversampled to ~1.1km grid
 }
 
 
@@ -398,6 +417,85 @@ def vegetation_image(s2, index_v):
 
 
 # ══════════════════════════════════════════════════════════════
+# FIRE, HEAT, AND POLLUTION — three new families, each backed by a
+# real, standard satellite data product rather than a derived proxy.
+# ══════════════════════════════════════════════════════════════
+
+def fire_index_image(s2, index_v):
+    """
+    Normalized Burn Ratio (NBR) — a standard, published technique for
+    mapping burned vegetation: healthy vegetation reflects strongly in
+    NIR and weakly in SWIR2, while a burn scar does the opposite. This
+    is the same formula used in official post-fire severity mapping
+    (e.g. USGS/USFS dNBR products), just applied to a single period
+    here rather than a before/after difference.
+    """
+    nir, swir2 = s2.select('B8'), s2.select('B12')
+    img = nir.subtract(swir2).divide(nir.add(swir2).max(0.0001))
+    return img.rename('value')
+
+
+def active_fire_mask(coords_roi, start_date, end_date):
+    """
+    Real active-fire hotspot detections from NASA FIRMS (Fire
+    Information for Resource Management System) — this is observed
+    thermal-anomaly hotspot data, not a derived index. Returns a
+    0/1-ish confidence image, masked to hotspot pixels only.
+    """
+    coll = ee.ImageCollection('FIRMS').filterBounds(coords_roi).filterDate(start_date, end_date)
+    img = coll.select('T21').max()  # brightness temperature of the hottest detection per pixel
+    # Normalise into a roughly 0-1 confidence-style value for consistent legend rendering
+    normalized = img.subtract(300).divide(500).clamp(0, 1)
+    return normalized.rename('value')
+
+
+def heat_index_image(composite, index_v, is_landsat):
+    """
+    Land Surface Temperature from Landsat's thermal band (ST_B10,
+    already scaled to Kelvin in Collection 2 Level-2 products — a
+    standard, published product used in real urban-heat-island
+    studies), converted to Celsius.
+    """
+    if is_landsat:
+        kelvin = composite.select('ST_B10')
+        celsius = kelvin.multiply(0.00341802).add(149.0).subtract(273.15)
+        return celsius.rename('value')
+    return composite.rename('value')
+
+
+def sst_image(coords_roi, start_date, end_date):
+    """
+    Real Sea Surface Temperature from NOAA's optimum-interpolation SST
+    product — a genuine, published ocean temperature dataset, not
+    derived from a land-focused sensor.
+    """
+    coll = (ee.ImageCollection('NOAA/CDR/OISST/V2_1')
+            .filterBounds(coords_roi).filterDate(start_date, end_date))
+    img = coll.select('sst').mean().multiply(0.01)  # product is scaled by 100
+    return img.rename('value'), coll.size()
+
+
+def pollution_index_image(coords_roi, start_date, end_date, index_v):
+    """
+    Real Sentinel-5P TROPOMI air-quality columns — genuine satellite
+    measurements of atmospheric trace gases, not estimated from
+    surface reflectance. NO2 (traffic/industrial), SO2 (industrial/
+    volcanic), and UV Aerosol Index (smoke, dust, pollution haze) are
+    all standard, published air-quality products.
+    """
+    band_map = {
+        'no2':     ('COPERNICUS/S5P/OFFL/L3_NO2', 'tropospheric_NO2_column_number_density'),
+        'so2':     ('COPERNICUS/S5P/OFFL/L3_SO2', 'SO2_column_number_density'),
+        'aerosol': ('COPERNICUS/S5P/OFFL/L3_AER_AI', 'absorbing_aerosol_index'),
+    }
+    coll_id, band = band_map[index_v]
+    coll = (ee.ImageCollection(coll_id).select(band)
+            .filterBounds(coords_roi).filterDate(start_date, end_date))
+    img = coll.mean()
+    return img.rename('value'), coll.size()
+
+
+# ══════════════════════════════════════════════════════════════
 # CHANGE MAP & HOTSPOT DETECTION
 # Two periods of the same index, compared pixel-by-pixel — classifies
 # every pixel as increased/stable/decreased, computes area per class,
@@ -485,6 +583,77 @@ def true_color_vis(composite, family):
         return composite.visualize(bands=['B4', 'B3', 'B2'], min=0, max=0.3, gamma=1.2)
     else:  # landsat, geo, urban/ubndbi — merged Landsat archive, logical band names
         return composite.visualize(bands=['red', 'green', 'blue'], min=0, max=0.3, gamma=1.2)
+
+
+def run_water_level(start1, end1, start2, end2, coords):
+    """
+    Estimates water surface elevation change using a genuine,
+    established remote sensing technique: since optical satellites
+    can't measure water depth directly, this reads the Copernicus DEM
+    elevation at the water's EDGE (the boundary of the NDWI water
+    mask) — the shoreline sits exactly at the water surface elevation
+    by definition, so the average boundary elevation is a real proxy
+    for water level. Doing this for two periods and comparing gives an
+    estimated water level change in real metres, not just a relative
+    index value. This is the same method used in published lake/
+    reservoir monitoring studies (e.g. Lake Mead).
+
+    Honest limitation, stated here and again in the response: the DEM
+    is a static, one-time dataset — if the shoreline terrain itself
+    changed between the two periods (erosion, sedimentation), that
+    introduces some error. Absolute elevation values also carry the
+    DEM's own vertical uncertainty (~3-10m), though comparing the same
+    location at two times cancels out much of that systematic error,
+    making the RELATIVE change more trustworthy than either reading
+    alone — still a PROXY MEASUREMENT, not certified altimetry.
+    """
+    if not (EE_AVAILABLE and init_ee()):
+        return {'error': 'GEE not available on this server right now — check /api/health first.'}
+    try:
+        roi = roi_from_coords(coords)
+        dem = ee.ImageCollection('COPERNICUS/DEM/GLO30').select('DEM').mosaic().clip(roi)
+
+        def boundary_elevation(start_date, end_date):
+            coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                    .filterBounds(roi).filterDate(start_date, end_date)
+                    .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+                    .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
+            count = coll.size().getInfo()
+            if count == 0:
+                return None, None, count
+            composite = coll.map(mask_s2).median().clip(roi)
+            water_mask = composite.normalizedDifference(['B3', 'B8']).gt(0.0)
+            # Boundary = water pixels adjacent to non-water pixels — an erosion
+            # trick: the mask minus its own erosion leaves just the edge ring.
+            eroded = water_mask.reduceNeighborhood(reducer=ee.Reducer.min(), kernel=ee.Kernel.square(1))
+            boundary = water_mask.And(eroded.Not()).selfMask()
+            elev_at_boundary = dem.updateMask(boundary)
+            stats = elev_at_boundary.reduceRegion(
+                reducer=ee.Reducer.mean().combine(ee.Reducer.count(), sharedInputs=True),
+                geometry=roi, scale=30, bestEffort=True, maxPixels=1e9, tileScale=4
+            ).getInfo()
+            return stats.get('DEM_mean'), stats.get('DEM_count'), count
+
+        level1, pixels1, count1 = boundary_elevation(start1, end1)
+        if level1 is None:
+            return {'error': 'No imagery found for the first period.'}
+        level2, pixels2, count2 = boundary_elevation(start2, end2)
+        if level2 is None:
+            return {'error': 'No imagery found for the second period.'}
+        if pixels1 is None or pixels2 is None or pixels1 < 5 or pixels2 < 5:
+            return {'error': 'Not enough water-boundary pixels detected to estimate a level — try a larger region or a lake/reservoir with a clearer shoreline.'}
+
+        change_m = round(level2 - level1, 2)
+        return {
+            'source': 'gee_live',
+            'images_period1': count1, 'images_period2': count2,
+            'level1_m': round(level1, 2), 'level2_m': round(level2, 2),
+            'change_m': change_m,
+            'boundary_pixels1': int(pixels1), 'boundary_pixels2': int(pixels2),
+        }
+    except Exception as e:
+        logger.error(f'Water level estimation error: {e}')
+        return {'error': str(e)}
 
 
 def run_change_map(family, index_v, start1, end1, start2, end2, coords):
@@ -793,6 +962,55 @@ def run_reading(family, index_v, start_date, end_date, coords):
                 composite = coll.select('VV').median().clip(roi)
                 img = composite.rename('value')
                 scale = 10
+
+        elif family == 'fire':
+            if index_v == 'activefire':
+                count = ee.ImageCollection('FIRMS').filterBounds(roi).filterDate(start_date, end_date).size().getInfo()
+                if count == 0: return {'error': 'No FIRMS active-fire detections for this period/region.'}
+                img = active_fire_mask(roi, start_date, end_date).clip(roi)
+                scale = 1000
+            else:  # 'nbr' — burn severity from Sentinel-2
+                coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
+                        .filterBounds(roi).filterDate(start_date, end_date)
+                        .filter(ee.Filter.lt('CLOUDY_PIXEL_PERCENTAGE', 40))
+                        .sort('CLOUDY_PIXEL_PERCENTAGE').limit(30))
+                count = coll.size().getInfo()
+                if count == 0: return {'error': 'No Sentinel-2 images for this period/region.'}
+                composite = coll.map(mask_s2).median().clip(roi)
+                img = fire_index_image(composite, index_v)
+                scale = 10
+
+        elif family == 'heat':
+            if index_v == 'sst':
+                img_raw, coll_size = sst_image(roi, start_date, end_date)
+                count = coll_size.getInfo()
+                if count == 0: return {'error': 'No sea surface temperature data for this period/region — this dataset only covers ocean areas.'}
+                img = img_raw.clip(roi)
+                scale = 1000
+            else:  # 'lst' — Landsat thermal band
+                coll = get_landsat_collection(roi, start_date, end_date)
+                count = coll.size().getInfo() if coll is not None else 0
+                if count == 0: return {'error': 'No Landsat imagery for this period/region.'}
+                # Thermal band isn't remapped by get_landsat_collection (that
+                # only handles the optical bands) — pull ST_B10 separately
+                # from the same collection window.
+                thermal_coll = (ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+                                .merge(ee.ImageCollection('LANDSAT/LC08/C02/T1_L2'))
+                                .filterBounds(roi).filterDate(start_date, end_date)
+                                .filter(ee.Filter.lt('CLOUD_COVER', 30)))
+                thermal_count = thermal_coll.size().getInfo()
+                if thermal_count == 0: return {'error': 'No Landsat thermal imagery for this period/region (thermal band only on Landsat 8/9).'}
+                composite = thermal_coll.median().clip(roi)
+                img = heat_index_image(composite, index_v, True)
+                scale = 30
+
+        elif family == 'pollution':
+            img_raw, coll_size = pollution_index_image(roi, start_date, end_date, index_v)
+            count = coll_size.getInfo()
+            if count == 0: return {'error': 'No Sentinel-5P data for this period/region.'}
+            img = img_raw.clip(roi)
+            scale = 1113
+
         else:
             return {'error': f'Unknown family: {family}'}
 
@@ -1157,6 +1375,14 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
     # meaningless flat line.
     if family == 'archaeology' and index_v in ('elevation', 'slope'):
         return {'error': 'Elevation and slope are static terrain data — trend charts apply to time-varying indices like vegetation anomaly or SAR instead.'}
+
+    # Heat and Pollution use entirely different collections (Landsat
+    # thermal/NOAA SST, Sentinel-5P) that the generic dispatch below
+    # doesn't know how to build — better to say so plainly than to
+    # silently fall through to the Sentinel-2 default and return
+    # wrong data under a real-looking chart.
+    if family in ('heat', 'pollution', 'fire'):
+        return {'error': f'Monthly trend charts for {family.title()} aren\'t built yet — single readings already work for this family.'}
 
     if not (EE_AVAILABLE and init_ee()):
         return simulate_timeseries(index_v, start_date, end_date)

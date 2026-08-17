@@ -58,8 +58,11 @@ say plainly that the data shows the pattern but not a confirmed cause, and sugge
 kind of field investigation would help — never guess at a specific cause.
 4. Write in plain, professional English. No bullet-point-only answers — write real \
 prose paragraphs, the way a human analyst would write a report section.
-5. Return ONLY valid JSON matching the exact schema you're asked for, no markdown code \
-fences, no preamble, no explanation outside the JSON.
+5. Your ENTIRE reply must be a single valid JSON object and nothing else. The very \
+first character of your reply must be "{" and the very last character must be "}". \
+Do not write any sentence, greeting, acknowledgement, or explanation before or after \
+the JSON. Do not wrap it in markdown code fences (no ```). If you find yourself about \
+to write anything other than the JSON object itself, stop and output only the JSON.
 """
 
 
@@ -127,46 +130,66 @@ def generate_ai_report(readings, location, change_map, trend):
 
 {json.dumps(payload, indent=2)}
 
-Return JSON with exactly this schema:
-{{
-  "per_calculation": [
-    {{"index": "<the index name>", "description": "<2-4 sentence plain-language paragraph describing what this specific reading shows, using its confidence level appropriately>"}}
-  ],
-  "synthesis": "<if there is more than one reading, a 2-4 paragraph synthesis connecting them into one holistic narrative. If there's only one reading, still provide a slightly deeper single-reading synthesis paragraph. If change_analysis or trend data is present, weave it in explicitly.>"
-}}"""
+Call the generate_report tool with your analysis."""
+
+        # Tool use (structured output) instead of asking Claude to format
+        # JSON in a plain text reply — this is the actual, reliable fix.
+        # Text-based JSON formatting depends on the model following
+        # prompt instructions exactly every single time, which is what
+        # was failing intermittently. Tool use enforces the schema at
+        # the API level, so the response is guaranteed to already be a
+        # correctly-shaped dict — no text parsing, no preamble risk,
+        # no markdown-fence guessing.
+        report_tool = {
+            "name": "generate_report",
+            "description": "Submit the per-calculation descriptions and holistic synthesis for this Earth observation report.",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "per_calculation": {
+                        "type": "array",
+                        "description": "One entry per reading in the input data.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "index": {"type": "string", "description": "The index name, exactly as given in the input."},
+                                "description": {"type": "string", "description": "2-4 sentence plain-language paragraph describing what this specific reading shows."}
+                            },
+                            "required": ["index", "description"]
+                        }
+                    },
+                    "synthesis": {
+                        "type": "string",
+                        "description": "2-4 paragraph holistic narrative connecting the readings (or a deeper single paragraph if there's only one reading)."
+                    }
+                },
+                "required": ["per_calculation", "synthesis"]
+            }
+        }
 
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
             max_tokens=2000,
             system=SYSTEM_PROMPT,
-            messages=[
-                {"role": "user", "content": user_prompt},
-                # Prefilling the assistant's turn with the opening brace is
-                # a reliable way to force Claude to continue directly into
-                # JSON — this is the actual fix for "AI response could not
-                # be parsed", since it prevents the stray preamble sentence
-                # or commentary that was causing that in the first place,
-                # rather than just parsing more defensively after the fact.
-                {"role": "assistant", "content": "{"}
-            ]
+            messages=[{"role": "user", "content": user_prompt}],
+            tools=[report_tool],
+            tool_choice={"type": "tool", "name": "generate_report"}
         )
 
-        raw_text = "{" + "".join(block.text for block in response.content if hasattr(block, 'text'))
-        raw_text = raw_text.strip()
-
-        parsed = _parse_ai_json(raw_text)
-        if parsed is None:
-            # This is the actual fix — previously this just said "could
-            # not be parsed" with zero information about why, making it
-            # impossible to diagnose without direct server log access.
-            # Now the real raw response (truncated) comes back in the
-            # error itself, and several parsing strategies are tried
-            # before giving up, since a model occasionally adds a stray
-            # preamble sentence or trailing comment even when told not to.
-            snippet = raw_text[:300].replace('\n', ' ')
-            logger.error(f'AI report: could not parse model output. Raw response started with: {snippet}')
-            return {'error': f'AI response could not be parsed. Raw output started with: "{snippet}..." — please try again; if this keeps happening, this snippet is what needs fixing in the prompt.'}
+        tool_use_block = next((b for b in response.content if getattr(b, 'type', None) == 'tool_use'), None)
+        if tool_use_block is None:
+            # Fallback: in case a future model variant still replies in
+            # plain text despite tool_choice, try to salvage it from the
+            # raw text rather than failing outright.
+            raw_text = "".join(getattr(b, 'text', '') for b in response.content).strip()
+            parsed = _parse_ai_json(raw_text)
+            if parsed is None:
+                snippet = raw_text[:300].replace('\n', ' ')
+                logger.error(f'AI report: no tool_use block and text fallback failed. Raw response started with: {snippet}')
+                return {'error': f'AI did not return structured output. Raw output started with: "{snippet}..." — please try again.'}
+        else:
+            parsed = tool_use_block.input  # already a parsed dict — no JSON string parsing needed
 
         if 'per_calculation' not in parsed or 'synthesis' not in parsed:
             return {'error': f'AI response was missing expected fields — got keys: {list(parsed.keys())}. Please try again.'}

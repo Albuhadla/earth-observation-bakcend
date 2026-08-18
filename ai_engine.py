@@ -26,6 +26,8 @@ reading.
 import os
 import json
 import logging
+import base64
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -286,3 +288,83 @@ def _parse_ai_json(raw_text):
             pass
 
     return None
+
+
+# ══════════════════════════════════════════════════════════════
+# TERRAIN PATTERN ANALYSIS — Archaeology & Terrain family only.
+# The only place in this whole platform where the AI actually looks
+# at the image itself, not just numbers. Deliberately scoped to
+# shape/pattern classification, never object identification — at
+# 10-30m per pixel, satellite imagery physically cannot resolve
+# individual objects the way a normal photo can, so pretending
+# otherwise would be a real honesty violation, not just an exaggeration.
+# ══════════════════════════════════════════════════════════════
+
+TERRAIN_PATTERN_SYSTEM_PROMPT = """You are a remote-sensing archaeologist describing a \
+satellite-derived terrain anomaly image. CRITICAL CONSTRAINT: satellite imagery at this \
+resolution (10-30 metres per pixel) CANNOT resolve individual objects the way a normal \
+photograph can — one pixel covers an area the size of a building or larger. You are doing \
+PATTERN-BASED SHAPE CLASSIFICATION, not object identification, and must never imply \
+otherwise.
+
+Describe only the geometric SHAPE of any anomaly visible (circular, linear, rectangular, \
+irregular, or none), then state which of these established archaeological remote-sensing \
+categories it is MOST CONSISTENT WITH, if any:
+- Circular/mound-shaped, raised, isolated from surroundings -> possible settlement mound (tell)
+- Linear, roughly consistent width, extends across the landscape -> possible buried wall, \
+ancient road, or canal
+- Rectangular/grid pattern, sharp right angles, regular repeated spacing -> possible \
+building foundations
+- Irregular, follows natural terrain contours with no consistent geometry -> most likely a \
+natural formation, not human-made — this is the correct answer for most images
+
+Rules, no exceptions:
+1. Use hedged language throughout: "consistent with", "could indicate", "worth investigating" \
+— never a confirmed identification.
+2. Never invent historical context, dates, cultures, or civilizations not visible in the \
+image itself.
+3. If the image shows no clear anomaly or pattern, say so plainly rather than inventing one \
+— an honest "nothing conclusive here" is a correct, useful answer.
+4. Always end with a one-sentence recommendation for field or ground verification.
+5. Keep the whole response to 2-4 sentences — a focused observation, not a report."""
+
+
+def analyze_terrain_pattern(thumb_url, index_v, index_label):
+    """
+    Sends the actual rendered terrain image to Claude for pattern-based
+    shape classification. Returns a short description string, or None
+    on any failure — never blocks or breaks the reading itself.
+    """
+    if not ANTHROPIC_AVAILABLE:
+        return None
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key or not thumb_url:
+        return None
+    try:
+        img_resp = requests.get(thumb_url, timeout=15)
+        if img_resp.status_code != 200:
+            logger.warning(f'Terrain pattern: could not fetch image, status {img_resp.status_code}')
+            return None
+        img_b64 = base64.b64encode(img_resp.content).decode('utf-8')
+        media_type = img_resp.headers.get('Content-Type', 'image/png').split(';')[0]
+        if media_type not in ('image/png', 'image/jpeg', 'image/webp', 'image/gif'):
+            media_type = 'image/png'
+
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model=ANTHROPIC_MODEL,
+            max_tokens=400,
+            system=TERRAIN_PATTERN_SYSTEM_PROMPT,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": img_b64}},
+                    {"type": "text", "text": f"This is a {index_label} terrain anomaly map. Describe the shape and suggest the most likely category, per your instructions."}
+                ]
+            }]
+        )
+        text = "".join(getattr(b, 'text', '') for b in response.content).strip()
+        return text if text else None
+    except Exception as e:
+        logger.warning(f'Terrain pattern analysis failed (non-fatal): {e}')
+        return None

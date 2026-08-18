@@ -262,6 +262,25 @@ def ai_report(user):
     return jsonify(result)
 
 
+@app.route('/api/ai/terrain-pattern', methods=['POST'])
+@token_required
+@pro_or_higher_required
+@rate_limit('20 per hour')
+def ai_terrain_pattern(user):
+    d = request.get_json()
+    thumb_url = d.get('thumb_url')
+    index_v = d.get('index')
+    index_label = d.get('index_label', index_v)
+
+    if not thumb_url or not index_v:
+        return jsonify({'error': 'thumb_url and index are required.'}), 400
+
+    description = ai_engine.analyze_terrain_pattern(thumb_url, index_v, index_label)
+    if description is None:
+        return jsonify({'error': 'Terrain pattern analysis could not be completed for this image.'}), 422
+    return jsonify({'description': description})
+
+
 # ══════════════════════════════════════════════════════════════
 # SAVED LOCATIONS — the foundation for recurring monitoring.
 # A saved location is just persisted region+family+index config;

@@ -644,13 +644,31 @@ def run_water_level(start1, end1, start2, end2, coords):
             return {'error': 'Not enough water-boundary pixels detected to estimate a level — try a larger region or a lake/reservoir with a clearer shoreline.'}
 
         change_m = round(level2 - level1, 2)
-        return {
+        result = {
             'source': 'gee_live',
             'images_period1': count1, 'images_period2': count2,
             'level1_m': round(level1, 2), 'level2_m': round(level2, 2),
             'change_m': change_m,
             'boundary_pixels1': int(pixels1), 'boundary_pixels2': int(pixels2),
         }
+
+        # Real USGS gauge validation, US coverage only — a genuinely
+        # measured water level, not another view of the DEM estimate.
+        # Never blocks the main result if it fails or no gauge is nearby.
+        try:
+            import ground_truth
+            lats = [c[0] for c in coords]; lngs = [c[1] for c in coords]
+            # Pad the ROI's bounding box slightly — a gauge just outside
+            # your exact drawn shape is still relevant for the same water body.
+            pad = 0.05  # ~5km at most latitudes
+            bbox = (min(lngs)-pad, min(lats)-pad, max(lngs)+pad, max(lats)+pad)
+            gt = ground_truth.get_usgs_water_level(bbox)
+            if gt:
+                result['usgs_ground_truth'] = gt
+        except Exception as e:
+            logger.warning(f'USGS ground-truth lookup skipped (non-fatal): {e}')
+
+        return result
     except Exception as e:
         logger.error(f'Water level estimation error: {e}')
         return {'error': str(e)}
@@ -1040,7 +1058,7 @@ def run_reading(family, index_v, start_date, end_date, coords):
         # instead of a synthetic placeholder.
         thumb_url = safe_thumb_url(index_v, roi, img=img, composite=composite)
 
-        return {
+        result = {
             'mean': round(mean, 4),
             'min':  round(stats.get('value_min', mean), 4),
             'max':  round(stats.get('value_max', mean), 4),
@@ -1049,6 +1067,23 @@ def run_reading(family, index_v, start_date, end_date, coords):
             'source': 'gee_live',
             'thumb_url': thumb_url
         }
+
+        # Real ground-station validation for Pollution — a genuinely
+        # different, independently-measured data point, not another
+        # view of the same satellite estimate. Never blocks the main
+        # reading if it fails or no station is nearby.
+        if family == 'pollution':
+            try:
+                import ground_truth
+                lat_c = sum(c[0] for c in coords) / len(coords)
+                lng_c = sum(c[1] for c in coords) / len(coords)
+                gt = ground_truth.get_openaq_ground_truth(lat_c, lng_c, index_v)
+                if gt:
+                    result['ground_truth'] = gt
+            except Exception as e:
+                logger.warning(f'Ground-truth lookup skipped (non-fatal): {e}')
+
+        return result
     except Exception as e:
         logger.error(f'GEE reading error: {e}')
         return simulate(family, index_v, start_date, end_date, real_error=str(e))

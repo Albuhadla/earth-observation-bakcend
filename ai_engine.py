@@ -73,19 +73,28 @@ def _classify_confidence(index_v):
 def _build_payload(readings, location, change_map, trend, water_level=None):
     """Strips each reading down to only the fields the model should see —
     deliberately not including internal IDs, raw thumbnail URLs, etc."""
+    def _reading_dict(r):
+        d = {
+            'index': r.get('title') or r.get('indexV'),
+            'family': r.get('fam'),
+            'confidence': _classify_confidence(r.get('indexV')),
+            'mean': r.get('mean'), 'min': r.get('min'), 'max': r.get('max'), 'std': r.get('std'),
+            'date_range': f"{r.get('start')} to {r.get('end')}",
+            'images_used': r.get('images'),
+        }
+        gt = r.get('groundTruth')
+        if gt:
+            d['real_ground_station_reading'] = {
+                'note': 'A genuine measured reading from a real ground station, not a satellite estimate — treat this as the more trustworthy of the two values where they can be directly compared.',
+                'station_name': gt.get('station_name'),
+                'parameter': gt.get('parameter'), 'value': gt.get('value'), 'unit': gt.get('unit'),
+                'is_direct_match': gt.get('is_direct_match'),
+            }
+        return d
+
     payload = {
         'location': location or None,
-        'readings': [
-            {
-                'index': r.get('title') or r.get('indexV'),
-                'family': r.get('fam'),
-                'confidence': _classify_confidence(r.get('indexV')),
-                'mean': r.get('mean'), 'min': r.get('min'), 'max': r.get('max'), 'std': r.get('std'),
-                'date_range': f"{r.get('start')} to {r.get('end')}",
-                'images_used': r.get('images'),
-            }
-            for r in readings
-        ],
+        'readings': [_reading_dict(r) for r in readings],
     }
     if change_map:
         payload['change_analysis'] = {
@@ -114,6 +123,13 @@ def _build_payload(readings, location, change_map, trend, water_level=None):
             'level_2_m': water_level.get('level2_m'),
             'change_m': water_level.get('change_m'),
         }
+        usgs = water_level.get('usgs_ground_truth')
+        if usgs:
+            payload['water_level_estimate']['real_usgs_gauge_reading'] = {
+                'note': 'A genuine measured USGS river/lake gauge reading near this region — the actual current water level in feet, not an estimate. Mention this explicitly as real validating evidence.',
+                'site_name': usgs.get('site_name'),
+                'gage_height_ft': usgs.get('gage_height_ft'),
+            }
     return payload
 
 

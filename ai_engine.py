@@ -133,11 +133,14 @@ def _build_payload(readings, location, change_map, trend, water_level=None):
     return payload
 
 
-def generate_ai_report(readings, location, change_map, trend, water_level=None):
+def generate_ai_report(readings, location, change_map, trend, water_level=None, language='en'):
     """
     Returns {'per_calculation': [{'index':..., 'description':...}, ...],
     'synthesis': '...'} or {'error': '...'} on failure. Never raises —
     always returns a dict so the route can respond cleanly either way.
+    language: 'en' (default) or 'ar' — writes the actual descriptions
+    and synthesis in Arabic when requested, not a translated-afterward
+    version, so the phrasing reads naturally rather than machine-translated.
     """
     if not ANTHROPIC_AVAILABLE:
         return {'error': 'AI module not installed on the server.'}
@@ -152,11 +155,19 @@ def generate_ai_report(readings, location, change_map, trend, water_level=None):
     try:
         payload = _build_payload(readings, location, change_map, trend, water_level)
 
+        language_instruction = (
+            "\n\nWrite your entire response — every description and the synthesis — in "
+            "Modern Standard Arabic. Keep index names, technical abbreviations (e.g. NDVI, "
+            "NDTI, NDBI), units, and numeric values exactly as given, un-translated, since "
+            "these are standard scientific notation even in Arabic-language reports."
+            if language == 'ar' else ""
+        )
+
         user_prompt = f"""Here is the structured data for this session:
 
 {json.dumps(payload, indent=2)}
 
-Call the generate_report tool with your analysis."""
+Call the generate_report tool with your analysis.{language_instruction}"""
 
         # Tool use (structured output) instead of asking Claude to format
         # JSON in a plain text reply — this is the actual, reliable fix.

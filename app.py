@@ -251,11 +251,12 @@ def ai_report(user):
     change_map = d.get('change_map')
     trend = d.get('trend')
     water_level = d.get('water_level')
+    language = d.get('language', 'en')
 
     if not readings and not water_level:
         return jsonify({'error': 'No calculations to describe — take at least one reading first.'}), 400
 
-    result = ai_engine.generate_ai_report(readings, location, change_map, trend, water_level)
+    result = ai_engine.generate_ai_report(readings, location, change_map, trend, water_level, language)
     if 'error' in result:
         return jsonify(result), 422
     return jsonify(result)

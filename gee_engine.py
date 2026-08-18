@@ -968,6 +968,7 @@ def run_reading(family, index_v, start_date, end_date, coords):
                 count = ee.ImageCollection('FIRMS').filterBounds(roi).filterDate(start_date, end_date).size().getInfo()
                 if count == 0: return {'error': 'No FIRMS active-fire detections for this period/region.'}
                 img = active_fire_mask(roi, start_date, end_date).clip(roi)
+                composite = None  # no true-colour composite for this data type — safe_thumb_url falls through to its generic single-band branch correctly
                 scale = 1000
             else:  # 'nbr' — burn severity from Sentinel-2
                 coll = (ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED')
@@ -986,6 +987,7 @@ def run_reading(family, index_v, start_date, end_date, coords):
                 count = coll_size.getInfo()
                 if count == 0: return {'error': 'No sea surface temperature data for this period/region — this dataset only covers ocean areas.'}
                 img = img_raw.clip(roi)
+                composite = None  # no true-colour composite for this data type — safe_thumb_url falls through to its generic single-band branch correctly
                 scale = 1000
             else:  # 'lst' — Landsat thermal band
                 coll = get_landsat_collection(roi, start_date, end_date)
@@ -1009,6 +1011,7 @@ def run_reading(family, index_v, start_date, end_date, coords):
             count = coll_size.getInfo()
             if count == 0: return {'error': 'No Sentinel-5P data for this period/region.'}
             img = img_raw.clip(roi)
+            composite = None  # no true-colour composite for this data type — safe_thumb_url falls through to its generic single-band branch correctly
             scale = 1113
 
         else:

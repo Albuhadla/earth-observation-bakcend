@@ -207,7 +207,7 @@ Call the generate_report tool with your analysis.{language_instruction}"""
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=2000,
+            max_tokens=4000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
             tools=[report_tool],
@@ -229,6 +229,14 @@ Call the generate_report tool with your analysis.{language_instruction}"""
             parsed = tool_use_block.input  # already a parsed dict — no JSON string parsing needed
 
         if 'per_calculation' not in parsed or 'synthesis' not in parsed:
+            # If the response was cut off by the token limit, say so
+            # directly instead of a generic "missing fields" message —
+            # this is what actually happened here, since per_calculation
+            # is generated before synthesis and a long session (or a
+            # language like Arabic that needs more tokens per sentence)
+            # can hit the ceiling before synthesis is written.
+            if getattr(response, 'stop_reason', None) == 'max_tokens':
+                return {'error': f'AI response was cut off by the length limit before finishing (got: {list(parsed.keys())}) — please try again; if this keeps happening, it may help to run this with fewer readings in the session at once.'}
             return {'error': f'AI response was missing expected fields — got keys: {list(parsed.keys())}. Please try again.'}
         return parsed
 

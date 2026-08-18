@@ -22,11 +22,16 @@ class User(db.Model):
     stripe_sub_id  = db.Column(db.String(100))
     created_at     = db.Column(db.DateTime, default=datetime.utcnow)
     active         = db.Column(db.Boolean, default=True)
+    is_complimentary = db.Column(db.Boolean, default=False)  # permanent access, bypasses billing entirely — for the developer account and shared test/reviewer accounts
+    totp_secret    = db.Column(db.String(64))   # base32 TOTP secret, only set once 2FA setup begins
+    totp_enabled   = db.Column(db.Boolean, default=False)  # only true once the user has verified a code — a secret alone doesn't enable 2FA
 
     readings = db.relationship('Reading', backref='owner', lazy=True, cascade='all, delete-orphan')
     saved_locations = db.relationship('SavedLocation', backref='owner', lazy=True, cascade='all, delete-orphan')
 
     def has_access(self):
+        if self.is_complimentary:
+            return True  # permanent access — never expires, no subscription needed
         if self.plan_status == 'active':
             return True
         if self.plan_status == 'trial' and self.trial_ends_at and self.trial_ends_at > datetime.utcnow():
@@ -39,6 +44,7 @@ class User(db.Model):
             'plan': self.plan, 'plan_status': self.plan_status,
             'trial_ends': self.trial_ends_at.isoformat() if self.trial_ends_at else None,
             'has_access': self.has_access(),
+            'is_complimentary': self.is_complimentary,
         }
 
 

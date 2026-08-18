@@ -12,8 +12,8 @@ Earth Observation and Analysis — Backend
   POST /api/analysis/timeseries  Monthly trend (subscription required)
   GET  /api/analysis/history     This user's saved readings
 """
-import os, logging, json
-from datetime import datetime
+import os, logging, json, hmac
+from datetime import datetime, timedelta
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from dotenv import load_dotenv
@@ -92,6 +92,168 @@ def rate_limit(limit_string):
 app.register_blueprint(auth_bp, url_prefix='/api/auth')
 app.register_blueprint(payments_bp, url_prefix='/api/payments')
 
+# Login and register get the same 200/hour default as everything else,
+# which is far too generous for password-guessing/spam-registration
+# resistance specifically. Applied here (after blueprint registration,
+# by endpoint name) rather than as a decorator inside auth.py, since
+# auth.py importing the limiter object directly would create a
+# circular import with this file.
+if limiter:
+    try:
+        app.view_functions['auth.login'] = limiter.limit('10 per hour')(app.view_functions['auth.login'])
+        app.view_functions['auth.register'] = limiter.limit('10 per hour')(app.view_functions['auth.register'])
+        logger.info('Tightened rate limits applied to login/register.')
+    except Exception as e:
+        logger.warning(f'Could not apply auth-specific rate limits (continuing with default): {e}')
+
+
+# ══════════════════════════════════════════════════════════════
+# ACCOUNT LOCKOUT + TWO-FACTOR AUTHENTICATION
+# Both built by wrapping the already-registered auth.login view
+# function (same technique as the rate-limit tightening just above)
+# rather than editing auth.py directly, so all the actual logic lives
+# in this one file.
+# ══════════════════════════════════════════════════════════════
+import pyotp
+import jwt as _jwt_lib
+from auth import SECRET as _AUTH_SECRET, gen_token as _auth_gen_token, check_pw as _auth_check_pw
+
+LOCKOUT_THRESHOLD = 5
+LOCKOUT_DURATION_MINUTES = 15
+# In-memory, keyed by email — resets on server restart, which is an
+# acceptable tradeoff for a lockout mechanism specifically (the
+# tightened rate limit above is the persistent-across-restarts layer).
+_failed_login_attempts = {}
+
+
+def _check_lockout(email):
+    entry = _failed_login_attempts.get(email)
+    if not entry or not entry.get('locked_until'):
+        return False, 0
+    if entry['locked_until'] > datetime.utcnow():
+        return True, int((entry['locked_until'] - datetime.utcnow()).total_seconds())
+    _failed_login_attempts.pop(email, None)  # lock has expired
+    return False, 0
+
+
+def _record_failed_login(email):
+    entry = _failed_login_attempts.setdefault(email, {'count': 0, 'locked_until': None})
+    entry['count'] += 1
+    if entry['count'] >= LOCKOUT_THRESHOLD:
+        entry['locked_until'] = datetime.utcnow() + timedelta(minutes=LOCKOUT_DURATION_MINUTES)
+
+
+def _record_successful_login(email):
+    _failed_login_attempts.pop(email, None)
+
+
+def _gen_2fa_pending_token(user_id):
+    """
+    A short-lived, narrowly-scoped token that can ONLY be used to
+    complete a 2FA login, not for any other API access — kept
+    completely separate from auth.gen_token()'s real access tokens so
+    a pending-2fa token can never accidentally work as a full login,
+    even though it's technically a valid JWT signed with the same key.
+    """
+    payload = {'user_id': user_id, 'purpose': 'pending_2fa', 'exp': datetime.utcnow() + timedelta(minutes=5)}
+    return _jwt_lib.encode(payload, _AUTH_SECRET, algorithm='HS256')
+
+
+_rate_limited_login = app.view_functions['auth.login']  # capture the already-rate-limited version
+
+def _login_with_lockout_and_2fa(*args, **kwargs):
+    d = request.get_json() or {}
+    email = (d.get('email', '') or '').lower().strip()
+
+    is_locked, retry_after = _check_lockout(email)
+    if is_locked:
+        return jsonify({
+            'error': f'Too many failed attempts on this account. Try again in {retry_after // 60 + 1} minute(s).',
+            'code': 'ACCOUNT_LOCKED'
+        }), 423
+
+    result = _rate_limited_login(*args, **kwargs)
+    response, status = (result[0], result[1]) if isinstance(result, tuple) else (result, result.status_code)
+
+    if status == 401:
+        _record_failed_login(email)
+        return result
+
+    # Password was correct.
+    _record_successful_login(email)
+    user = User.query.filter_by(email=email).first()
+    if user and user.totp_enabled:
+        # Don't hand out the real access token yet — the frontend must
+        # call /api/auth/2fa/verify-login with a code from the user's
+        # authenticator app before getting a real token.
+        return jsonify({'requires_2fa': True, 'pending_token': _gen_2fa_pending_token(user.id)})
+    return result
+
+app.view_functions['auth.login'] = _login_with_lockout_and_2fa
+
+
+@app.route('/api/auth/2fa/setup', methods=['POST'])
+@token_required
+def setup_2fa(user):
+    """Generates a new TOTP secret — not yet enabled until the user
+    verifies a code from their authenticator app via /verify-setup,
+    so a half-finished setup can never accidentally lock someone out."""
+    secret = pyotp.random_base32()
+    user.totp_secret = secret
+    user.totp_enabled = False
+    db.session.commit()
+    uri = pyotp.totp.TOTP(secret).provisioning_uri(name=user.email, issuer_name='Earth Observation and Analysis')
+    return jsonify({'secret': secret, 'provisioning_uri': uri})
+
+
+@app.route('/api/auth/2fa/verify-setup', methods=['POST'])
+@token_required
+def verify_2fa_setup(user):
+    d = request.get_json() or {}
+    code = (d.get('code') or '').strip()
+    if not user.totp_secret:
+        return jsonify({'error': 'Call /api/auth/2fa/setup first.'}), 400
+    if not pyotp.TOTP(user.totp_secret).verify(code, valid_window=1):
+        return jsonify({'error': 'Incorrect code — please try again.'}), 400
+    user.totp_enabled = True
+    db.session.commit()
+    return jsonify({'message': '2FA is now enabled on your account.'})
+
+
+@app.route('/api/auth/2fa/disable', methods=['POST'])
+@token_required
+def disable_2fa(user):
+    # Requires the actual password again, not just the session token —
+    # disabling 2FA is a meaningful security downgrade, worth the
+    # extra confirmation step.
+    d = request.get_json() or {}
+    if not _auth_check_pw(d.get('password', ''), user.password_hash):
+        return jsonify({'error': 'Incorrect password.'}), 401
+    user.totp_enabled = False
+    user.totp_secret = None
+    db.session.commit()
+    return jsonify({'message': '2FA has been disabled.'})
+
+
+@app.route('/api/auth/2fa/verify-login', methods=['POST'])
+@rate_limit('10 per hour')
+def verify_2fa_login():
+    d = request.get_json() or {}
+    try:
+        payload = _jwt_lib.decode(d.get('pending_token', ''), _AUTH_SECRET, algorithms=['HS256'])
+    except Exception:
+        return jsonify({'error': 'This login session has expired — please sign in again.'}), 401
+    if payload.get('purpose') != 'pending_2fa':
+        return jsonify({'error': 'Invalid token.'}), 401
+
+    user = User.query.get(payload.get('user_id'))
+    if not user or not user.totp_enabled or not user.totp_secret:
+        return jsonify({'error': 'Invalid request.'}), 400
+    if not pyotp.TOTP(user.totp_secret).verify((d.get('code') or '').strip(), valid_window=1):
+        return jsonify({'error': 'Incorrect code.'}), 401
+
+    return jsonify({'token': _auth_gen_token(user.id), 'user': user.to_dict()})
+
 
 def subscription_required(f):
     """Wrap a token_required view to also require an active plan/trial."""
@@ -158,6 +320,49 @@ def health():
         'gee_available': ee_ready,
         'gee_init_error': gee_engine._last_ee_init_error if not ee_ready else None
     })
+
+
+@app.route('/api/admin/grant-permanent-access', methods=['POST'])
+@rate_limit('5 per hour')
+def admin_grant_permanent_access():
+    """
+    Marks an existing user account as permanently complimentary —
+    never expires, bypasses billing entirely. For the developer's own
+    account and shared test/reviewer accounts, not for real customers.
+
+    Protected by a separate secret (NOT a normal user login token) set
+    via the ADMIN_SECRET_KEY environment variable — this endpoint is
+    deliberately outside the normal @token_required/@subscription_required
+    system, since its whole purpose is to bypass that system for
+    specific accounts. Rate-limited and uses a constant-time comparison
+    (hmac.compare_digest) rather than == specifically because this
+    endpoint grants permanent Enterprise access — worth the extra care
+    beyond what a normal route needs.
+    """
+    admin_secret = os.getenv('ADMIN_SECRET_KEY')
+    if not admin_secret:
+        return jsonify({'error': 'Admin access is not configured on this server.'}), 503
+    provided = request.headers.get('X-Admin-Secret', '')
+    if not provided or not hmac.compare_digest(provided, admin_secret):
+        return jsonify({'error': 'Invalid or missing admin secret.'}), 403
+
+    d = request.get_json() or {}
+    email = d.get('email')
+    plan = d.get('plan', 'enterprise')
+    if not email:
+        return jsonify({'error': 'email is required.'}), 400
+    if plan not in ('basic', 'pro', 'enterprise'):
+        return jsonify({'error': 'plan must be basic, pro, or enterprise.'}), 400
+
+    target = User.query.filter_by(email=email).first()
+    if not target:
+        return jsonify({'error': f'No account found with email {email}. Register the account first, then grant access.'}), 404
+
+    target.is_complimentary = True
+    target.plan = plan
+    target.plan_status = 'active'
+    db.session.commit()
+    return jsonify({'message': f'{email} now has permanent {plan} access.', 'user': target.to_dict()})
 
 
 @app.route('/api/test/watershed', methods=['POST'])
@@ -488,6 +693,30 @@ def server_error(e): return jsonify({'error': 'Internal server error.'}), 500
 try:
     with app.app_context():
         db.create_all()
+        # db.create_all() only creates tables that don't exist yet — it
+        # never alters an existing table to add a new column. Since
+        # is_complimentary was added to an already-live users table,
+        # this checks for it directly and adds it if missing, so
+        # existing accounts/databases don't crash on deploy. Safe to
+        # run every startup — does nothing once the column exists.
+        from sqlalchemy import inspect, text
+        inspector = inspect(db.engine)
+        existing_columns = [c['name'] for c in inspector.get_columns('users')]
+        if 'is_complimentary' not in existing_columns:
+            with db.engine.connect() as conn:
+                conn.execute(text('ALTER TABLE users ADD COLUMN is_complimentary BOOLEAN DEFAULT 0'))
+                conn.commit()
+            logging.info('Migrated: added is_complimentary column to users table.')
+        if 'totp_secret' not in existing_columns:
+            with db.engine.connect() as conn:
+                conn.execute(text('ALTER TABLE users ADD COLUMN totp_secret VARCHAR(64)'))
+                conn.commit()
+            logging.info('Migrated: added totp_secret column to users table.')
+        if 'totp_enabled' not in existing_columns:
+            with db.engine.connect() as conn:
+                conn.execute(text('ALTER TABLE users ADD COLUMN totp_enabled BOOLEAN DEFAULT 0'))
+                conn.commit()
+            logging.info('Migrated: added totp_enabled column to users table.')
         logging.info('Database tables ready.')
 except Exception as e:
     logging.error(f'db.create_all() failed on startup: {e}')

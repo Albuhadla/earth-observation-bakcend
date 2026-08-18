@@ -365,8 +365,8 @@ def analysis_advanced(user):
 
 PLAN_FAMILY_ACCESS = {
     'basic':      {'water', 'veg'},
-    'pro':        {'water', 'veg', 'landsat', 'geo', 'urban'},
-    'enterprise': {'water', 'veg', 'landsat', 'geo', 'urban', 'archaeology'},
+    'pro':        {'water', 'veg', 'landsat', 'geo', 'urban', 'fire', 'heat', 'pollution'},
+    'enterprise': {'water', 'veg', 'landsat', 'geo', 'urban', 'archaeology', 'fire', 'heat', 'pollution'},
 }
 PLAN_MONTHLY_LIMIT = {'basic': 50, 'pro': 300, 'enterprise': None}  # None = unlimited
 

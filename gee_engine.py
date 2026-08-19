@@ -6,7 +6,9 @@ Python port of the index math from the GEE JavaScript app
 simulation if the `earthengine-api` package or credentials
 are not available, so the API always returns something.
 """
-import os, hashlib, random, logging, math
+import os, hashlib, random, logging, math, base64
+import requests
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -206,6 +208,105 @@ def compute_adaptive_scale(roi_area_m2, native_scale, target_pixels=2_000_000):
     return max(native_scale, round(ideal_scale))
 
 
+def crop_thumb_to_content(thumb_url, padding_frac=0.06):
+    """
+    Earth Engine's getThumbURL() always returns a rectangular image
+    matching the ROI's bounding box — for a thin, diagonal, or oddly-
+    angled region, most of that rectangle falls outside the actual
+    drawn polygon and comes back fully transparent. The visible real
+    content ends up occupying only a small fraction of the image,
+    which is what was actually being reported as "only a fraction of
+    the image showing."
+
+    This fetches the thumbnail, finds the real bounding box of the
+    non-transparent pixels, and crops to that — with a small padding
+    margin so the region doesn't look uncomfortably tight against the
+    edges. Returns a data: URI (so no extra hosting/URL needed), or
+    the original URL unchanged if anything about this fails, since a
+    slightly-too-wide image is a much smaller problem than a broken one.
+    """
+    try:
+        from PIL import Image
+        resp = requests.get(thumb_url, timeout=15)
+        if resp.status_code != 200:
+            return thumb_url
+        img = Image.open(BytesIO(resp.content)).convert('RGBA')
+
+        alpha = img.split()[-1]
+        bbox = alpha.getbbox()
+        if bbox is None:
+            return thumb_url  # fully transparent — nothing to crop to, leave as-is
+
+        left, top, right, bottom = bbox
+        w, h = img.size
+        pad_x = int((right - left) * padding_frac)
+        pad_y = int((bottom - top) * padding_frac)
+        left = max(0, left - pad_x); top = max(0, top - pad_y)
+        right = min(w, right + pad_x); bottom = min(h, bottom + pad_y)
+
+        # If the real content is already most of the image, cropping
+        # would barely change anything — skip the extra work entirely.
+        if (right - left) >= w * 0.92 and (bottom - top) >= h * 0.92:
+            return thumb_url
+
+        cropped = img.crop((left, top, right, bottom))
+        buf = BytesIO()
+        cropped.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+        return f'data:image/png;base64,{b64}'
+    except Exception as e:
+        logger.warning(f'Thumbnail crop-to-content skipped (non-fatal): {e}')
+        return thumb_url
+
+
+def crop_thumb_pair_to_shared_content(url_a, url_b, padding_frac=0.06):
+    """
+    Same idea as crop_thumb_to_content(), but for a before/after PAIR
+    that needs to stay visually comparable — crops both images to the
+    UNION of their content bounds (not each one's own tightest crop
+    independently), so a real side-by-side comparison isn't looking at
+    two different zoom levels. Returns (url_a, url_b), each either a
+    cropped data: URI or its original URL unchanged if anything fails.
+    """
+    try:
+        from PIL import Image
+        resp_a = requests.get(url_a, timeout=15)
+        resp_b = requests.get(url_b, timeout=15)
+        if resp_a.status_code != 200 or resp_b.status_code != 200:
+            return url_a, url_b
+
+        img_a = Image.open(BytesIO(resp_a.content)).convert('RGBA')
+        img_b = Image.open(BytesIO(resp_b.content)).convert('RGBA')
+        if img_a.size != img_b.size:
+            return url_a, url_b  # shouldn't happen (same ROI/dimensions), but don't risk a mismatched union
+
+        bbox_a = img_a.split()[-1].getbbox()
+        bbox_b = img_b.split()[-1].getbbox()
+        if bbox_a is None or bbox_b is None:
+            return url_a, url_b
+
+        left = min(bbox_a[0], bbox_b[0]); top = min(bbox_a[1], bbox_b[1])
+        right = max(bbox_a[2], bbox_b[2]); bottom = max(bbox_a[3], bbox_b[3])
+        w, h = img_a.size
+        pad_x = int((right - left) * padding_frac); pad_y = int((bottom - top) * padding_frac)
+        left = max(0, left - pad_x); top = max(0, top - pad_y)
+        right = min(w, right + pad_x); bottom = min(h, bottom + pad_y)
+
+        if (right - left) >= w * 0.92 and (bottom - top) >= h * 0.92:
+            return url_a, url_b  # already mostly full — not worth cropping
+
+        def _encode(img):
+            cropped = img.crop((left, top, right, bottom))
+            buf = BytesIO()
+            cropped.save(buf, format='PNG')
+            return f'data:image/png;base64,{base64.b64encode(buf.getvalue()).decode("utf-8")}'
+
+        return _encode(img_a), _encode(img_b)
+    except Exception as e:
+        logger.warning(f'Paired thumbnail crop skipped (non-fatal): {e}')
+        return url_a, url_b
+
+
 def safe_thumb_url(index_v, roi, img=None, composite=None):
     """
     Generate a real, GEE-rendered PNG of the actual computed layer,
@@ -216,6 +317,7 @@ def safe_thumb_url(index_v, roi, img=None, composite=None):
     """
     native_scale = NATIVE_SCALE.get(index_v, 30)
     dims = compute_optimal_dimensions(roi, native_scale)
+    raw_url = None
     try:
         if index_v == 'elevation' and composite is not None:
             # Raised-relief hillshade — reveals subtle mounds/depressions
@@ -224,24 +326,31 @@ def safe_thumb_url(index_v, roi, img=None, composite=None):
             # self-normalising (always renders 0-255 regardless of the
             # actual metres involved).
             hillshade = ee.Terrain.hillshade(composite, 315, 45)  # standard NW light, 45° sun angle
-            return hillshade.clip(roi).getThumbURL({
+            raw_url = hillshade.clip(roi).getThumbURL({
                 'region': roi, 'dimensions': dims, 'format': 'png', 'min': 0, 'max': 255
             })
-        if index_v in RGB_VIS and composite is not None:
+        elif index_v in RGB_VIS and composite is not None:
             vis = RGB_VIS[index_v]
-            return composite.clip(roi).getThumbURL({
+            raw_url = composite.clip(roi).getThumbURL({
                 'region': roi, 'dimensions': dims, 'format': 'png', **vis
             })
-        if img is not None:
+        elif img is not None:
             lo, hi = RANGES.get(index_v, (0, 1))
             palette = PALETTES.get(index_v, ['0a3040', '0e5468', '00c2d1'])
-            return img.select('value').clip(roi).getThumbURL({
+            raw_url = img.select('value').clip(roi).getThumbURL({
                 'region': roi, 'dimensions': dims, 'format': 'png',
                 'min': lo, 'max': hi, 'palette': palette
             })
     except Exception as e:
         logger.warning(f'Thumbnail generation failed for {index_v}: {e}')
-    return None
+        return None
+
+    if raw_url is None:
+        return None
+    # A thin, diagonal, or oddly-angled ROI leaves most of this
+    # rectangular thumbnail transparent — crop to the real visible
+    # content so the region isn't lost in a mostly-empty image.
+    return crop_thumb_to_content(raw_url)
 
 
 
@@ -796,6 +905,7 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
         try:
             vis = classified.visualize(min=-1, max=1, palette=['d73027', 'bdbdbd', '1a9850'])
             thumb_url = vis.clip(roi).getThumbURL({'region': roi, 'dimensions': dims, 'format': 'png'})
+            thumb_url = crop_thumb_to_content(thumb_url)
         except Exception as e:
             logger.warning(f'Change map thumbnail failed: {e}')
 
@@ -812,6 +922,11 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
                 {'region': roi, 'dimensions': dims, 'format': 'png'})
             after_thumb_url = true_color_vis(composite2, family).clip(roi).getThumbURL(
                 {'region': roi, 'dimensions': dims, 'format': 'png'})
+            # Cropped together to a SHARED bounding box (not each own
+            # tightest crop independently) so before/after stay visually
+            # comparable at the same zoom level — see the two-image
+            # variant of the helper below.
+            before_thumb_url, after_thumb_url = crop_thumb_pair_to_shared_content(before_thumb_url, after_thumb_url)
         except Exception as e:
             logger.warning(f'Change map before/after thumbnail failed: {e}')
 

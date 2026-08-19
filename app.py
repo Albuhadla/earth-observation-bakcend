@@ -49,7 +49,15 @@ if SENTRY_DSN:
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-me-in-production')
-app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('DATABASE_URL', 'sqlite:///razaza.db')
+
+# Railway (like Heroku before it) often hands out Postgres URLs using the
+# legacy "postgres://" scheme — SQLAlchemy 1.4+ rejects that outright with
+# a "could not determine dialect" crash, requiring "postgresql://"
+# instead. Same connection, just the modern scheme name.
+_db_url = os.getenv('DATABASE_URL', 'sqlite:///razaza.db')
+if _db_url.startswith('postgres://'):
+    _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
+app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # Connection pool tuning — matters once on PostgreSQL with real concurrent
 # traffic; harmless no-ops on SQLite. pool_pre_ping avoids the classic
@@ -198,12 +206,22 @@ def setup_2fa(user):
     """Generates a new TOTP secret — not yet enabled until the user
     verifies a code from their authenticator app via /verify-setup,
     so a half-finished setup can never accidentally lock someone out."""
+    import qrcode, qrcode.image.pil, io, base64
     secret = pyotp.random_base32()
     user.totp_secret = secret
     user.totp_enabled = False
     db.session.commit()
     uri = pyotp.totp.TOTP(secret).provisioning_uri(name=user.email, issuer_name='Earth Observation and Analysis')
-    return jsonify({'secret': secret, 'provisioning_uri': uri})
+
+    # Real QR code generated server-side, rather than depending on an
+    # extra frontend JS library — the authenticator app just needs to
+    # scan this image, no client-side QR rendering required.
+    qr_img = qrcode.make(uri, image_factory=qrcode.image.pil.PilImage)
+    buf = io.BytesIO()
+    qr_img.save(buf, format='PNG')
+    qr_b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+
+    return jsonify({'secret': secret, 'provisioning_uri': uri, 'qr_code_png_base64': qr_b64})
 
 
 @app.route('/api/auth/2fa/verify-setup', methods=['POST'])
@@ -634,12 +652,13 @@ def analysis_run(user):
 
     # Serve from cache when possible — identical region/dates/index
     # returns instantly instead of re-running Earth Engine.
-    result = result_cache.get(family, index_v, start, end, coords)
+    cache_params = {'family': family, 'index': index_v, 'start': start, 'end': end}
+    result = result_cache.get('reading', cache_params, coords)
     if result is None:
         result = gee_engine.run_reading(family, index_v, start, end, coords)
         if 'error' in result:
             return jsonify(result), 422
-        result_cache.set(family, index_v, start, end, coords, result)
+        result_cache.set('reading', cache_params, result, coords)
     else:
         logger.info(f'Cache hit: {family}/{index_v} {start}->{end}')
 
@@ -705,7 +724,7 @@ try:
         existing_columns = [c['name'] for c in inspector.get_columns('users')]
         if 'is_complimentary' not in existing_columns:
             with db.engine.connect() as conn:
-                conn.execute(text('ALTER TABLE users ADD COLUMN is_complimentary BOOLEAN DEFAULT 0'))
+                conn.execute(text('ALTER TABLE users ADD COLUMN is_complimentary BOOLEAN DEFAULT FALSE'))
                 conn.commit()
             logging.info('Migrated: added is_complimentary column to users table.')
         if 'totp_secret' not in existing_columns:
@@ -715,7 +734,7 @@ try:
             logging.info('Migrated: added totp_secret column to users table.')
         if 'totp_enabled' not in existing_columns:
             with db.engine.connect() as conn:
-                conn.execute(text('ALTER TABLE users ADD COLUMN totp_enabled BOOLEAN DEFAULT 0'))
+                conn.execute(text('ALTER TABLE users ADD COLUMN totp_enabled BOOLEAN DEFAULT FALSE'))
                 conn.commit()
             logging.info('Migrated: added totp_enabled column to users table.')
         logging.info('Database tables ready.')

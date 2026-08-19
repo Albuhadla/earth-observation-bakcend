@@ -45,6 +45,7 @@ class User(db.Model):
             'trial_ends': self.trial_ends_at.isoformat() if self.trial_ends_at else None,
             'has_access': self.has_access(),
             'is_complimentary': self.is_complimentary,
+            'totp_enabled': self.totp_enabled,
         }
 
 

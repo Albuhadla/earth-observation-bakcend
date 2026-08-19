@@ -837,7 +837,13 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
         start_mean = mean_stats.get('start')
         end_mean = mean_stats.get('end')
         overall_change_pct = None
-        if start_mean not in (None, 0):
+        # Both values need to be real numbers before subtracting — a
+        # region with a valid start-period reading but no matching
+        # pixels in the end period (or vice versa) leaves one side as
+        # None, and None minus a float throws outright rather than
+        # just skipping the percentage, which was crashing the whole
+        # change map instead of just omitting one derived number.
+        if start_mean not in (None, 0) and end_mean is not None:
             overall_change_pct = round((end_mean - start_mean) / abs(start_mean) * 100, 1)
 
         # ── Hotspot detection — zones of largest significant change ──

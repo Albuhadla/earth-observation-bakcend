@@ -22,24 +22,27 @@ logger = logging.getLogger(__name__)
 CACHE_TTL_HOURS = int(os.getenv('CACHE_TTL_HOURS', 24))
 
 
-def _make_key(family, index_v, start, end, coords):
+def _make_key(kind, params, coords=None):
     """
-    Deterministic cache key from the exact request. Coordinates are
-    rounded to ~1 metre precision so trivially-different polygon
+    Deterministic cache key from the exact request. `kind` separates
+    different endpoint types (reading/changemap/trend/waterlevel/
+    advanced) so they can never collide with each other even if their
+    parameter dicts happen to look similar. Coordinates (if present)
+    are rounded to ~1 metre precision so trivially-different polygon
     drawings of "the same" region still hit the cache, while genuinely
     different regions don't collide.
     """
-    rounded = [[round(lat, 5), round(lng, 5)] for lat, lng in coords]
-    payload = json.dumps({
-        'f': family, 'i': index_v, 's': start, 'e': end, 'c': rounded
-    }, sort_keys=True)
+    payload_dict = dict(params)
+    if coords:
+        payload_dict['_coords'] = [[round(lat, 5), round(lng, 5)] for lat, lng in coords]
+    payload = json.dumps({'kind': kind, 'params': payload_dict}, sort_keys=True)
     return hashlib.sha256(payload.encode('utf-8')).hexdigest()
 
 
-def get(family, index_v, start, end, coords):
+def get(kind, params, coords=None):
     """Return a cached result dict, or None if not cached / expired."""
     try:
-        key = _make_key(family, index_v, start, end, coords)
+        key = _make_key(kind, params, coords)
         row = ReadingCache.query.filter_by(cache_key=key).first()
         if not row:
             return None
@@ -55,14 +58,14 @@ def get(family, index_v, start, end, coords):
         return None
 
 
-def set(family, index_v, start, end, coords, result):
+def set(kind, params, result, coords=None):
     """Store a finished result. Never lets a cache-write failure break the request."""
     try:
         # Don't cache errors or simulated fallbacks — only real results
-        # are worth serving to a second user without recomputation.
+        # are worth serving to a second request without recomputation.
         if not result or 'error' in result or result.get('source') != 'gee_live':
             return
-        key = _make_key(family, index_v, start, end, coords)
+        key = _make_key(kind, params, coords)
         existing = ReadingCache.query.filter_by(cache_key=key).first()
         expires = datetime.utcnow() + timedelta(hours=CACHE_TTL_HOURS)
         payload = json.dumps({k: v for k, v in result.items() if k != 'cached'})

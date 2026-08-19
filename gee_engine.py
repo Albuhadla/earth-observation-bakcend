@@ -1406,7 +1406,7 @@ def _simulate_advanced(tool, coords, real_error=None):
             'num_classes':5, 'classes':classes, 'note':note}
 
 
-def run_timeseries(family, index_v, start_date, end_date, coords):
+def run_timeseries(family, index_v, start_date, end_date, coords, max_points=None):
     # Elevation/slope are static terrain data, not a time series — a
     # monthly trend chart doesn't apply to them the way it does to an
     # actual satellite index. Fail clearly rather than returning a
@@ -1459,6 +1459,21 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
 
         start = ee.Date(start_date); end = ee.Date(end_date)
         n_months = end.difference(start, 'month').round()
+        n_months_val = int(n_months.getInfo())
+        if n_months_val < 1:
+            n_months_val = 1
+
+        # max_points gives a deliberately lighter-weight trend — evenly
+        # spaced samples across the full range instead of every single
+        # month. Used when a full per-month series for many indices at
+        # once (e.g. Auto-Analyze running an entire family) would be
+        # prohibitively slow; a normal single "Plot Trend" click still
+        # gets the full monthly resolution.
+        if max_points and n_months_val > max_points:
+            step = (n_months_val - 1) / (max_points - 1) if max_points > 1 else 0
+            month_indices = sorted(set(round(i * step) for i in range(max_points)))
+        else:
+            month_indices = list(range(n_months_val))
 
         def month_val(n):
             n = ee.Number(n)
@@ -1497,7 +1512,7 @@ def run_timeseries(family, index_v, start_date, end_date, coords):
             val = idx.select('value').reduceRegion(ee.Reducer.mean(), roi, scale, bestEffort=True).get('value')
             return ee.Feature(None, {'m': m0.format('YYYY-MM'), 'v': val})
 
-        fc = ee.FeatureCollection(ee.List.sequence(0, n_months.subtract(1)).map(month_val))
+        fc = ee.FeatureCollection(ee.List(month_indices).map(month_val))
         info = fc.getInfo()
         labels, values = [], []
         for f in info['features']:

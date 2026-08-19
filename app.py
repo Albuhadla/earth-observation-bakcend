@@ -665,10 +665,11 @@ def analysis_timeseries(user):
     d = request.get_json()
     family, index_v = d.get('family'), d.get('index')
     start, end, coords = d.get('start'), d.get('end'), d.get('roi')
+    max_points = d.get('max_points')  # optional — a lighter-weight trend for contexts like Auto-Analyze
     if not all([family, index_v, start, end, coords]):
         return jsonify({'error': 'family, index, start, end and roi are all required.'}), 400
 
-    result = gee_engine.run_timeseries(family, index_v, start, end, coords)
+    result = gee_engine.run_timeseries(family, index_v, start, end, coords, max_points=max_points)
     return jsonify(result)
 
 

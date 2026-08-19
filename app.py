@@ -617,7 +617,7 @@ PLAN_MONTHLY_LIMIT = {'basic': 50, 'pro': 300, 'enterprise': None}  # None = unl
 @app.route('/api/analysis/run', methods=['POST'])
 @token_required
 @subscription_required
-@rate_limit('30 per hour')
+@rate_limit('300 per hour')
 def analysis_run(user):
     d = request.get_json()
     family, index_v = d.get('family'), d.get('index')

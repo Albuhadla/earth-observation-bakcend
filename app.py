@@ -611,7 +611,7 @@ PLAN_FAMILY_ACCESS = {
     'pro':        {'water', 'veg', 'landsat', 'geo', 'urban', 'fire', 'heat', 'pollution'},
     'enterprise': {'water', 'veg', 'landsat', 'geo', 'urban', 'archaeology', 'fire', 'heat', 'pollution'},
 }
-PLAN_MONTHLY_LIMIT = {'basic': 50, 'pro': 300, 'enterprise': None}  # None = unlimited
+PLAN_MONTHLY_LIMIT = {'basic': 50, 'pro': 300, 'enterprise': 2000}  # generous ceiling, not true unlimited — GEE (commercial tier) and Anthropic API usage are both real, metered costs, and a single very active account on a flat $199/mo price could otherwise exceed what that revenue covers
 
 
 @app.route('/api/analysis/run', methods=['POST'])

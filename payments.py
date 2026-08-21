@@ -57,15 +57,32 @@ def subscribe(user):
             try: stripe.Subscription.cancel(user.stripe_sub_id)
             except Exception: pass
 
-        sub = stripe.Subscription.create(
-            customer=user.stripe_customer_id,
-            items=[{'price': PRICE_IDS[plan]}],
-            trial_period_days=14,
-            metadata={'user_id': str(user.id), 'plan': plan}
-        )
-        user.plan = plan; user.plan_status = 'trial'; user.stripe_sub_id = sub.id
+        # Trial is Basic-only — Pro and Enterprise are our highest-usage
+        # tiers (Auto-Analyze, Advanced Analytics, larger monthly quotas),
+        # meaning real GEE and Anthropic API cost starts accruing the
+        # moment someone signs up, whether or not they ever convert to a
+        # paying customer. A free trial there is pure cost exposure with
+        # no revenue to offset it. Basic's usage ceiling is low enough
+        # that a trial there stays a reasonable acquisition cost.
+        sub_params = {
+            'customer': user.stripe_customer_id,
+            'items': [{'price': PRICE_IDS[plan]}],
+            'metadata': {'user_id': str(user.id), 'plan': plan}
+        }
+        if plan == 'basic':
+            sub_params['trial_period_days'] = 14
+
+        sub = stripe.Subscription.create(**sub_params)
+        user.plan = plan
+        # Keep this accurate to what Stripe actually did — Basic really
+        # is in a trial (no charge yet), but Pro/Enterprise are charged
+        # immediately, so marking them 'trial' too would be misleading
+        # about their actual billing state.
+        user.plan_status = 'trial' if plan == 'basic' else 'active'
+        user.stripe_sub_id = sub.id
         db.session.commit()
-        return jsonify({'message': f'Subscribed to {plan} with 14-day trial.', 'user': user.to_dict()})
+        trial_note = ' with 14-day trial' if plan == 'basic' else ''
+        return jsonify({'message': f'Subscribed to {plan}{trial_note}.', 'user': user.to_dict()})
     except stripe.error.CardError as e:
         return jsonify({'error': f'Card error: {e.user_message}'}), 402
     except stripe.error.StripeError as e:

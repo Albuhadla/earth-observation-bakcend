@@ -1,0 +1,6 @@
+# Never commit real credentials or local settings
+.env
+gee_key.json
+*.pyc
+__pycache__/
+*.db

@@ -431,6 +431,35 @@ def analysis_changemap(user):
     return jsonify(result)
 
 
+@app.route('/api/test/diverging-change', methods=['POST'])
+@token_required
+@rate_limit('15 per hour')
+def test_diverging_change(user):
+    """
+    TEST-ONLY endpoint, deliberately isolated from the main change map
+    route above — no subscription_required gate, so this is testable
+    on any logged-in account regardless of plan while validating the
+    idea. Not linked from the main app; reached only via the standalone
+    test page. Safe to remove entirely once (or if) this graduates into
+    a real feature on the main Change Map.
+    """
+    d = request.get_json()
+    family, index_v = d.get('family'), d.get('index')
+    start1, end1 = d.get('start1'), d.get('end1')
+    start2, end2 = d.get('start2'), d.get('end2')
+    coords = d.get('roi')
+
+    if not all([family, index_v, start1, end1, start2, end2, coords]):
+        return jsonify({'error': 'family, index, start1, end1, start2, end2 and roi are all required.'}), 400
+    if len(coords) < 3:
+        return jsonify({'error': 'Region needs at least 3 points.'}), 400
+
+    result = gee_engine.run_diverging_change_test(family, index_v, start1, end1, start2, end2, coords)
+    if 'error' in result:
+        return jsonify(result), 422
+    return jsonify(result)
+
+
 @app.route('/api/analysis/waterlevel', methods=['POST'])
 @token_required
 @subscription_required

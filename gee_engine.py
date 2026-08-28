@@ -122,7 +122,7 @@ PALETTES = {
     'scrub':     ['ffffff','d4c870','303000'],
     'mud':       ['004080','80b8d0','ffffff'],
     'sav':       ['002040','0060a0','80d0f0'],
-    'nightlights': ['000000','1a0033','4d0080','b30086','ff8c00','ffeb3b','ffffff'],
+    'nightlights': ['020c1f','0a1e42','1f3864','c17f2e','ffab40','ffd54f','fffde7'],  # NASA "Black Marble" style — deep navy through amber gold to warm white, not the previous purple/magenta ramp
     'ubndbi':    ['313695','abd9e9','fdae61','a50026'],
     'slope':     ['1a9850','a6d96a','fee08b','fc8d59','d73027'],
     'vegAnomaly':['8c510a','d8b365','f5f5f5','5ab4ac','01665e'],
@@ -307,7 +307,7 @@ def crop_thumb_pair_to_shared_content(url_a, url_b, padding_frac=0.06):
         return url_a, url_b
 
 
-def safe_thumb_url(index_v, roi, img=None, composite=None):
+def safe_thumb_url(index_v, roi, img=None, composite=None, start_date=None, end_date=None):
     """
     Generate a real, GEE-rendered PNG of the actual computed layer,
     clipped to the drawn ROI — this is what makes the frontend show
@@ -319,7 +319,30 @@ def safe_thumb_url(index_v, roi, img=None, composite=None):
     dims = compute_optimal_dimensions(roi, native_scale)
     raw_url = None
     try:
-        if index_v == 'elevation' and composite is not None:
+        if index_v == 'nightlights' and img is not None and start_date and end_date:
+            # Raw nightlights alone is just bright dots floating in
+            # blackness — no way to tell where anything actually is.
+            # Fetching a real Sentinel-2 true-colour composite for the
+            # same ROI/period, darkening it to simulate a "night" base
+            # (not pure black — coastlines/terrain stay faintly
+            # visible), and adding the nightlights glow on top gives a
+            # genuine "Black Marble" look with real geographic context,
+            # rather than an abstract value-only rendering.
+            try:
+                _, base_img, _ = get_composite_and_index('urban', 's2rgb', roi, start_date, end_date)
+                if base_img is not None:
+                    dimmed_base = base_img.visualize(bands=['red','green','blue'], min=0, max=0.3, gamma=1.2).multiply(0.35)
+                    lo, hi = RANGES.get('nightlights', (0, 40))
+                    lights_glow = img.select('value').visualize(min=lo, max=hi, palette=PALETTES['nightlights'])
+                    blended = dimmed_base.add(lights_glow).min(255)  # additive blend, clamped so it never overflows/wraps
+                    raw_url = blended.clip(roi).getThumbURL({'region': roi, 'dimensions': dims, 'format': 'png'})
+            except Exception as e:
+                logger.warning(f'Nightlights blend failed, falling back to lights-only: {e}')
+                raw_url = None  # falls through to the plain palette render below
+
+        if raw_url is not None:
+            pass
+        elif index_v == 'elevation' and composite is not None:
             # Raised-relief hillshade — reveals subtle mounds/depressions
             # that raw elevation colouring would hide, since absolute
             # elevation varies wildly by region but relief shading is
@@ -1245,7 +1268,7 @@ def run_reading(family, index_v, start_date, end_date, coords):
         # Real GEE-rendered thumbnail of the actual computed layer,
         # clipped to the exact ROI — shown on the frontend map/panel
         # instead of a synthetic placeholder.
-        thumb_url = safe_thumb_url(index_v, roi, img=img, composite=composite)
+        thumb_url = safe_thumb_url(index_v, roi, img=img, composite=composite, start_date=start_date, end_date=end_date)
 
         result = {
             'mean': round(mean, 4),

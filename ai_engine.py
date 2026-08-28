@@ -154,6 +154,17 @@ def generate_ai_report(readings, location, change_map, trend, water_level=None, 
     if not readings and not water_level:
         return {'error': 'No calculations to describe — take at least one reading first.'}
 
+    # Cap the number of readings actually sent — an accumulated session
+    # history (multiple Auto-Analyze runs across different families
+    # without clearing) can otherwise grow large, and every single
+    # reading needs its own written description, which scales up both
+    # response time and the real risk of hitting the request timeout.
+    # Most recent readings are kept, since they're the most likely to
+    # be what the person actually wants analyzed right now.
+    MAX_READINGS_FOR_AI = 20
+    if len(readings) > MAX_READINGS_FOR_AI:
+        readings = readings[-MAX_READINGS_FOR_AI:]
+
     try:
         payload = _build_payload(readings, location, change_map, trend, water_level)
 

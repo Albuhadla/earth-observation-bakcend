@@ -954,6 +954,74 @@ def run_change_map(family, index_v, start1, end1, start2, end2, coords):
         return {'error': str(e)}
 
 
+def run_diverging_change_test(family, index_v, start1, end1, start2, end2, coords):
+    """
+    TEST-ONLY function, isolated from the main change map — a continuous,
+    zero-centered diverging visualization of change magnitude, rather
+    than the 3-class (increase/stable/decrease) classification the main
+    Change Map uses. Inspired by a diverging-colormap raster comparison
+    technique (purple = decrease, white = no change, orange = increase),
+    reusing the same composite-building logic as the main change map so
+    results stay consistent with the rest of the platform.
+    """
+    if not (EE_AVAILABLE and init_ee()):
+        return {'error': 'GEE not available on this server right now — check /api/health first.'}
+    try:
+        roi = roi_from_coords(coords)
+
+        composite1, img1, count1 = get_composite_and_index(family, index_v, roi, start1, end1)
+        if img1 is None:
+            return {'error': 'No imagery found for the first period.'}
+        composite2, img2, count2 = get_composite_and_index(family, index_v, roi, start2, end2)
+        if img2 is None:
+            return {'error': 'No imagery found for the second period.'}
+
+        val1 = img1.select('value')
+        val2 = img2.select('value')
+        diff = val2.subtract(val1).rename('diff')
+
+        roi_area_m2 = roi.area(1).getInfo()
+        native_scale = NATIVE_SCALE.get(index_v, 30)
+        effective_scale = compute_adaptive_scale(roi_area_m2, native_scale, target_pixels=1_500_000)
+
+        # Real min/max of the actual difference, so the diverging palette
+        # is centered and scaled to what's really in this specific
+        # region/period pair, not a generic fixed guess.
+        stats = diff.reduceRegion(
+            reducer=ee.Reducer.minMax().combine(ee.Reducer.mean(), sharedInputs=True),
+            geometry=roi, scale=effective_scale, bestEffort=True, maxPixels=1e9, tileScale=4
+        ).getInfo()
+        diff_min = stats.get('diff_min')
+        diff_max = stats.get('diff_max')
+        diff_mean = stats.get('diff_mean')
+        if diff_min is None or diff_max is None:
+            return {'error': 'No overlapping valid pixels between the two periods for this region.'}
+
+        # Symmetric around zero, so "no change" always lands exactly on
+        # the palette's white midpoint regardless of whether increases
+        # or decreases happen to be larger in this particular case.
+        bound = max(abs(diff_min), abs(diff_max)) or 0.0001
+
+        dims = compute_optimal_dimensions(roi, native_scale)
+        diverging_palette = ['b35806', 'f1a340', 'fee0b6', 'f7f7f7', 'd8daeb', '998ec3', '542788']  # PuOr — orange=negative, purple=positive, matching matplotlib's actual convention
+        raw_url = diff.clip(roi).getThumbURL({
+            'region': roi, 'dimensions': dims, 'format': 'png',
+            'min': -bound, 'max': bound, 'palette': diverging_palette
+        })
+        thumb_url = crop_thumb_to_content(raw_url)
+
+        return {
+            'thumb_url': thumb_url,
+            'diff_min': round(diff_min, 4), 'diff_max': round(diff_max, 4), 'diff_mean': round(diff_mean, 4),
+            'bound_used': round(bound, 4),
+            'images_period1': count1, 'images_period2': count2,
+            'source': 'gee_live',
+        }
+    except Exception as e:
+        logger.error(f'Diverging change test error: {e}')
+        return {'error': f'Test failed: {e}'}
+
+
 # ── main entry point ────────────────────────────────────────────
 
 def run_reading(family, index_v, start_date, end_date, coords):

@@ -1395,8 +1395,17 @@ def run_tree_count(start_date, end_date, coords):
         thumb_url = None
         try:
             highlight = composite.visualize(bands=['B4','B3','B2'], min=0, max=0.3, gamma=1.2)
-            dots = peaks.visualize(palette=['ff3b30'], forceRgbOutput=True)
-            combined = ee.ImageCollection([highlight, dots.updateMask(peaks)]).mosaic()
+            # A detected peak is a single native 10m pixel — rendered at
+            # a thumbnail resolution coarser than that (common for a
+            # larger farm/ROI), that one pixel blows up into a large,
+            # blocky square rather than staying a small dot. Buffering
+            # to a small, FIXED real-world radius keeps every dot a
+            # consistent, deliberately small size regardless of how the
+            # ROI size and thumbnail resolution happen to relate.
+            dot_radius_m = 3
+            buffered_peaks = peaks.focalMax(kernel=ee.Kernel.circle(radius=dot_radius_m, units='meters'))
+            dots = buffered_peaks.visualize(palette=['ff3b30'], forceRgbOutput=True)
+            combined = ee.ImageCollection([highlight, dots.updateMask(buffered_peaks)]).mosaic()
             thumb_url = combined.clip(roi).getThumbURL({'region': roi, 'dimensions': dims, 'format': 'png'})
         except Exception as e:
             logger.warning(f'Tree count thumbnail failed: {e}')

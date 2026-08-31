@@ -227,7 +227,14 @@ def crop_thumb_to_content(thumb_url, padding_frac=0.06):
     """
     try:
         from PIL import Image
-        resp = requests.get(thumb_url, timeout=15)
+        # A shorter timeout than you'd normally reach for — this fetch
+        # happens once per index during Auto-Analyze, so a slow/failing
+        # attempt at 15s each was stacking up across several indices in
+        # one session and pushing the whole request past OTHER timeouts,
+        # causing that specific image to come back completely empty
+        # rather than just uncropped. Failing fast here means a single
+        # slow crop attempt costs far less of the overall budget.
+        resp = requests.get(thumb_url, timeout=6)
         if resp.status_code != 200:
             return thumb_url
         img = Image.open(BytesIO(resp.content)).convert('RGBA')
@@ -270,8 +277,12 @@ def crop_thumb_pair_to_shared_content(url_a, url_b, padding_frac=0.06):
     """
     try:
         from PIL import Image
-        resp_a = requests.get(url_a, timeout=15)
-        resp_b = requests.get(url_b, timeout=15)
+        # Same shorter timeout as the single-image version, and for
+        # the same reason — this fetch happens twice per call, adding
+        # up fast if it's slow, so failing quickly matters more here
+        # than it would for a one-off request.
+        resp_a = requests.get(url_a, timeout=6)
+        resp_b = requests.get(url_b, timeout=6)
         if resp_a.status_code != 200 or resp_b.status_code != 200:
             return url_a, url_b
 

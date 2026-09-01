@@ -1215,6 +1215,27 @@ def run_reading(family, index_v, start_date, end_date, coords):
             'thumb_url': thumb_url
         }
 
+        # NDWI's mean value across the whole ROI mostly reflects how
+        # much of the drawn region is land vs water, not a direct
+        # measurement of water extent — a negative mean, for example,
+        # just means the ROI contains a lot of non-water land, not
+        # that "water decreased". A real water mask (thresholded at
+        # the standard NDWI>0 water/non-water cutoff) and its actual
+        # area gives an honest, directly-interpretable number instead.
+        if index_v == 'NDWI':
+            try:
+                water_mask = img.select('value').gt(0)
+                water_area_m2 = ee.Image.pixelArea().updateMask(water_mask).reduceRegion(
+                    reducer=ee.Reducer.sum(), geometry=roi, scale=effective_scale,
+                    bestEffort=True, maxPixels=1e9, tileScale=4
+                ).get('area')
+                water_area_m2 = water_area_m2.getInfo() if water_area_m2 is not None else None
+                if water_area_m2 is not None and roi_area_m2:
+                    result['water_area_ha'] = round(water_area_m2 / 10000, 2)
+                    result['water_pct_of_aoi'] = round((water_area_m2 / roi_area_m2) * 100, 1)
+            except Exception as e:
+                logger.warning(f'NDWI water-area calculation skipped (non-fatal): {e}')
+
         # Real ground-station validation for Pollution — a genuinely
         # different, independently-measured data point, not another
         # view of the same satellite estimate. Never blocks the main

@@ -213,109 +213,33 @@ def crop_thumb_to_content(thumb_url, padding_frac=0.06):
     Earth Engine's getThumbURL() always returns a rectangular image
     matching the ROI's bounding box — for a thin, diagonal, or oddly-
     angled region, most of that rectangle falls outside the actual
-    drawn polygon and comes back fully transparent. The visible real
-    content ends up occupying only a small fraction of the image,
-    which is what was actually being reported as "only a fraction of
-    the image showing."
+    drawn polygon and comes back fully transparent. This function was
+    built to crop that down to just the real content.
 
-    This fetches the thumbnail, finds the real bounding box of the
-    non-transparent pixels, and crops to that — with a small padding
-    margin so the region doesn't look uncomfortably tight against the
-    edges. Returns a data: URI (so no extra hosting/URL needed), or
-    the original URL unchanged if anything about this fails, since a
-    slightly-too-wide image is a much smaller problem than a broken one.
+    TEMPORARILY DISABLED as of Sept 2026 — on the current server
+    environment, the internal re-fetch this needs was timing out 100%
+    of the time (confirmed from real logs — not occasional, every
+    single attempt), which was actively causing images to go missing
+    entirely rather than just showing uncropped. A feature that
+    reliably breaks something working is worse than not having it, so
+    this returns the original URL immediately without attempting the
+    fetch, until a more reliable approach is found (e.g. fetching from
+    a different network path, or handling this client-side instead).
     """
-    try:
-        from PIL import Image
-        # A shorter timeout than you'd normally reach for — this fetch
-        # happens once per index during Auto-Analyze, so a slow/failing
-        # attempt at 15s each was stacking up across several indices in
-        # one session and pushing the whole request past OTHER timeouts,
-        # causing that specific image to come back completely empty
-        # rather than just uncropped. Failing fast here means a single
-        # slow crop attempt costs far less of the overall budget.
-        resp = requests.get(thumb_url, timeout=6)
-        if resp.status_code != 200:
-            return thumb_url
-        img = Image.open(BytesIO(resp.content)).convert('RGBA')
-
-        alpha = img.split()[-1]
-        bbox = alpha.getbbox()
-        if bbox is None:
-            return thumb_url  # fully transparent — nothing to crop to, leave as-is
-
-        left, top, right, bottom = bbox
-        w, h = img.size
-        pad_x = int((right - left) * padding_frac)
-        pad_y = int((bottom - top) * padding_frac)
-        left = max(0, left - pad_x); top = max(0, top - pad_y)
-        right = min(w, right + pad_x); bottom = min(h, bottom + pad_y)
-
-        # If the real content is already most of the image, cropping
-        # would barely change anything — skip the extra work entirely.
-        if (right - left) >= w * 0.92 and (bottom - top) >= h * 0.92:
-            return thumb_url
-
-        cropped = img.crop((left, top, right, bottom))
-        buf = BytesIO()
-        cropped.save(buf, format='PNG')
-        b64 = base64.b64encode(buf.getvalue()).decode('utf-8')
-        return f'data:image/png;base64,{b64}'
-    except Exception as e:
-        logger.warning(f'Thumbnail crop-to-content skipped (non-fatal): {e}')
-        return thumb_url
+    return thumb_url
 
 
 def crop_thumb_pair_to_shared_content(url_a, url_b, padding_frac=0.06):
     """
     Same idea as crop_thumb_to_content(), but for a before/after PAIR
     that needs to stay visually comparable — crops both images to the
-    UNION of their content bounds (not each one's own tightest crop
-    independently), so a real side-by-side comparison isn't looking at
-    two different zoom levels. Returns (url_a, url_b), each either a
-    cropped data: URI or its original URL unchanged if anything fails.
+    UNION of their content bounds.
+
+    TEMPORARILY DISABLED alongside crop_thumb_to_content() — same
+    confirmed 100% timeout failure on the current server environment.
+    Returns both URLs unchanged until a reliable fix is found.
     """
-    try:
-        from PIL import Image
-        # Same shorter timeout as the single-image version, and for
-        # the same reason — this fetch happens twice per call, adding
-        # up fast if it's slow, so failing quickly matters more here
-        # than it would for a one-off request.
-        resp_a = requests.get(url_a, timeout=6)
-        resp_b = requests.get(url_b, timeout=6)
-        if resp_a.status_code != 200 or resp_b.status_code != 200:
-            return url_a, url_b
-
-        img_a = Image.open(BytesIO(resp_a.content)).convert('RGBA')
-        img_b = Image.open(BytesIO(resp_b.content)).convert('RGBA')
-        if img_a.size != img_b.size:
-            return url_a, url_b  # shouldn't happen (same ROI/dimensions), but don't risk a mismatched union
-
-        bbox_a = img_a.split()[-1].getbbox()
-        bbox_b = img_b.split()[-1].getbbox()
-        if bbox_a is None or bbox_b is None:
-            return url_a, url_b
-
-        left = min(bbox_a[0], bbox_b[0]); top = min(bbox_a[1], bbox_b[1])
-        right = max(bbox_a[2], bbox_b[2]); bottom = max(bbox_a[3], bbox_b[3])
-        w, h = img_a.size
-        pad_x = int((right - left) * padding_frac); pad_y = int((bottom - top) * padding_frac)
-        left = max(0, left - pad_x); top = max(0, top - pad_y)
-        right = min(w, right + pad_x); bottom = min(h, bottom + pad_y)
-
-        if (right - left) >= w * 0.92 and (bottom - top) >= h * 0.92:
-            return url_a, url_b  # already mostly full — not worth cropping
-
-        def _encode(img):
-            cropped = img.crop((left, top, right, bottom))
-            buf = BytesIO()
-            cropped.save(buf, format='PNG')
-            return f'data:image/png;base64,{base64.b64encode(buf.getvalue()).decode("utf-8")}'
-
-        return _encode(img_a), _encode(img_b)
-    except Exception as e:
-        logger.warning(f'Paired thumbnail crop skipped (non-fatal): {e}')
-        return url_a, url_b
+    return url_a, url_b
 
 
 def safe_thumb_url(index_v, roi, img=None, composite=None, start_date=None, end_date=None):

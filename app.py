@@ -544,7 +544,7 @@ def ai_terrain_pattern(user):
 # family/quota gating already in place for readings. None of this
 # blocks a user from taking normal one-off readings; it only limits
 # how many locations can be under ongoing automatic monitoring.
-PLAN_LOCATION_LIMIT = {'basic': 0, 'pro': 5, 'enterprise': 25}
+PLAN_LOCATION_LIMIT = {'basic': 0, 'pro': 0, 'enterprise': 25}
 
 
 @app.route('/api/locations', methods=['GET'])
@@ -594,6 +594,18 @@ def delete_location(user, location_id):
     db.session.delete(loc)
     db.session.commit()
     return jsonify({'deleted': True})
+
+
+@app.route('/api/locations/<int:location_id>/toggle', methods=['PATCH'])
+@token_required
+def toggle_location(user, location_id):
+    """Pause/resume monitoring without deleting the location and its history."""
+    loc = SavedLocation.query.filter_by(id=location_id, user_id=user.id).first()
+    if not loc:
+        return jsonify({'error': 'Location not found.'}), 404
+    loc.active = not loc.active
+    db.session.commit()
+    return jsonify(loc.to_dict())
 
 
 @app.route('/api/locations/<int:location_id>/history', methods=['GET'])

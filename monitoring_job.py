@@ -24,7 +24,7 @@ subsequent scheduled run).
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask
 from models import db, User, SavedLocation, LocationHistory
@@ -110,16 +110,17 @@ def run_weekly_checks():
         for loc in locations:
             try:
                 coords = json.loads(loc.roi_geojson)
-                end = datetime.utcnow().strftime('%Y-%m-%d')
+                end = datetime.now(timezone.utc).strftime('%Y-%m-%d')
                 # 90-day trailing window keeps each check reasonably
                 # fast and current, rather than always re-scanning the
                 # location's entire history on every run.
                 from datetime import timedelta
-                start = (datetime.utcnow() - timedelta(days=90)).strftime('%Y-%m-%d')
+                start = (datetime.now(timezone.utc) - timedelta(days=90)).strftime('%Y-%m-%d')
 
                 result = gee_engine.run_reading(loc.family, loc.index_name, start, end, coords)
                 if 'error' in result or result.get('source') == 'simulated':
-                    logger.warning(f'Location {loc.id} ({loc.name}): reading failed or simulated, skipping this check — not recorded as a false data point.')
+                    reason = result.get('error') or result.get('real_error') or 'unknown reason — no error detail returned'
+                    logger.warning(f'Location {loc.id} ({loc.name}): reading failed or simulated, skipping this check — not recorded as a false data point. Reason: {reason}')
                     failed += 1
                     continue
 
@@ -143,7 +144,7 @@ def run_weekly_checks():
                 )
                 db.session.add(entry)
 
-                loc.last_checked_at = datetime.utcnow()
+                loc.last_checked_at = datetime.now(timezone.utc).replace(tzinfo=None)  # naive UTC, matching the rest of the codebase's datetime columns — avoids mixing aware/naive datetimes in the same database
                 loc.last_mean_value = new_mean
                 loc.last_status = 'anomaly' if is_anomaly else 'normal'
                 db.session.commit()

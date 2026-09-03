@@ -83,7 +83,7 @@ class SavedLocation(db.Model):
     family          = db.Column(db.String(20), nullable=False)
     index_name      = db.Column(db.String(30), nullable=False)
     roi_geojson     = db.Column(db.Text, nullable=False)
-    check_frequency = db.Column(db.String(20), default='monthly')  # weekly / monthly
+    check_frequency = db.Column(db.String(20), default='weekly')  # matches the actual monitoring_job.py cron schedule (0 6 * * 1) — was left at the old 'monthly' default
     active          = db.Column(db.Boolean, default=True)
     last_checked_at = db.Column(db.DateTime)
     last_mean_value = db.Column(db.Float)

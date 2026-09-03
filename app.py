@@ -778,6 +778,20 @@ try:
                 conn.execute(text('ALTER TABLE users ADD COLUMN totp_enabled BOOLEAN DEFAULT FALSE'))
                 conn.commit()
             logging.info('Migrated: added totp_enabled column to users table.')
+
+        # One-time data fix, not a schema migration: check_frequency's
+        # column default was 'monthly' from before the actual weekly
+        # cron job existed — any saved locations created before this
+        # fix still have the stale 'monthly' value stored, which the
+        # UI displays verbatim ("checked monthly") even though the real
+        # job has always run weekly. Runs harmlessly every startup —
+        # a no-op once no rows are left to fix.
+        with db.engine.connect() as conn:
+            result = conn.execute(text("UPDATE saved_locations SET check_frequency = 'weekly' WHERE check_frequency = 'monthly'"))
+            conn.commit()
+            if result.rowcount:
+                logging.info(f"Data fix: corrected {result.rowcount} saved location(s) from stale 'monthly' to 'weekly'.")
+
         logging.info('Database tables ready.')
 except Exception as e:
     logging.error(f'db.create_all() failed on startup: {e}')

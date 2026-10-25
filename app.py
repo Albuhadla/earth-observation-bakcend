@@ -416,7 +416,7 @@ def test_watershed(user):
 @app.route('/api/analysis/changemap', methods=['POST'])
 @token_required
 @subscription_required
-@rate_limit('15 per hour')
+@rate_limit('60 per hour')
 def analysis_changemap(user):
     d = request.get_json()
     family, index_v = d.get('family'), d.get('index')
@@ -521,7 +521,7 @@ def ai_report(user):
 @app.route('/api/ai/terrain-pattern', methods=['POST'])
 @token_required
 @pro_or_higher_required
-@rate_limit('20 per hour')
+@rate_limit('100 per hour')
 def ai_terrain_pattern(user):
     d = request.get_json()
     thumb_url = d.get('thumb_url')
@@ -724,7 +724,7 @@ def analysis_run(user):
 @app.route('/api/analysis/timeseries', methods=['POST'])
 @token_required
 @subscription_required
-@rate_limit('15 per hour')
+@rate_limit('200 per hour')
 def analysis_timeseries(user):
     d = request.get_json()
     family, index_v = d.get('family'), d.get('index')

@@ -57,6 +57,11 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-me-in-production')
 _db_url = os.getenv('DATABASE_URL', 'sqlite:///razaza.db')
 if _db_url.startswith('postgres://'):
     _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
+# Always use the psycopg2 driver we install (requirements.txt). A URL written
+# as postgresql+psycopg:// (psycopg v3) would crash every worker on boot.
+for _bad in ('postgresql+psycopg://', 'postgresql+psycopg3://'):
+    if _db_url.startswith(_bad):
+        _db_url = _db_url.replace(_bad, 'postgresql+psycopg2://', 1)
 app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # Connection pool tuning — matters once on PostgreSQL with real concurrent

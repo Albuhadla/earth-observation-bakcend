@@ -60,7 +60,21 @@ say plainly that the data shows the pattern but not a confirmed cause, and sugge
 kind of field investigation would help — never guess at a specific cause.
 4. Write in plain, professional English. No bullet-point-only answers — write real \
 prose paragraphs, the way a human analyst would write a report section.
-5. Your ENTIRE reply must be a single valid JSON object and nothing else. The very \
+5a. BE SPECIFIC AND DETAILED. Generic statements such as "vegetation is healthy" are not \
+acceptable. Every paragraph must cite the actual figures from the data: the mean, the \
+min–max range, the standard deviation, the number of images, the exact date range, the \
+start-to-end change, detected water area in hectares, hotspot sizes and locations, trend \
+direction and slope, and the region's area in hectares. Explain what each number means in \
+practice (e.g. what a spread of that size says about uniformity across the region), \
+compare readings against each other where the data allows, and say which finding matters \
+most. If a figure is not in the data, do not mention it.
+5b. When the readings are part of a full category analysis, treat them as ONE assessment of \
+that category: connect the indices to each other, identify agreement and contradiction \
+between them, and give an overall conclusion for the category.
+5c. End the synthesis with concrete, prioritised recommended actions and the specific \
+follow-up measurements or field checks that would confirm or rule out each finding. \
+Recommendations must follow from the data and respect the confidence labels.
+6. Your ENTIRE reply must be a single valid JSON object and nothing else. The very \
 first character of your reply must be "{" and the very last character must be "}". \
 Do not write any sentence, greeting, acknowledgement, or explanation before or after \
 the JSON. Do not wrap it in markdown code fences (no ```). If you find yourself about \
@@ -84,6 +98,18 @@ def _build_payload(readings, location, change_map, trend, water_level=None):
             'date_range': f"{r.get('start')} to {r.get('end')}",
             'images_used': r.get('images'),
         }
+        # Extra computed facts — only included when present, so the model
+        # can be specific using real numbers instead of generalities.
+        for src, dst in [('category','category'), ('roi_area_ha','region_area_ha'),
+                         ('status','platform_status_flag'),
+                         ('start_window_mean','mean_at_start_of_period'), ('end_window_mean','mean_at_end_of_period'),
+                         ('window_change_pct','start_to_end_change_pct'), ('window_absolute_change','start_to_end_absolute_change'),
+                         ('water_area_ha','detected_water_area_ha'), ('water_pct_of_aoi','water_pct_of_region'),
+                         ('mini_trend','monthly_trend_points')]:
+            if r.get(src) is not None:
+                d[dst] = r.get(src)
+        if r.get('is_group_analysis'):
+            d['part_of_full_category_analysis'] = True
         gt = r.get('groundTruth')
         if gt:
             d['real_ground_station_reading'] = {
@@ -203,14 +229,14 @@ Call the generate_report tool with your analysis.{language_instruction}"""
                             "type": "object",
                             "properties": {
                                 "index": {"type": "string", "description": "The index name, exactly as given in the input."},
-                                "description": {"type": "string", "description": "2-4 sentence plain-language paragraph describing what this specific reading shows."}
+                                "description": {"type": "string", "description": "A detailed paragraph of 5-8 sentences: the headline finding with its actual mean, range and std; what that spread means spatially; the start-to-end change or trend if present; image count and period; the confidence level and what it means for how far to trust it; and one specific practical implication."}
                             },
                             "required": ["index", "description"]
                         }
                     },
                     "synthesis": {
                         "type": "string",
-                        "description": "2-4 paragraph holistic narrative connecting the readings (or a deeper single paragraph if there's only one reading). If water_level_estimate is present in the input, explicitly weave it in — state the estimated change in metres, note it's a PROXY MEASUREMENT (not direct altimetry), and connect it to the other readings where relevant (e.g. does a water level drop align with a water extent decrease?)."
+                        "description": "A 5-7 paragraph professional narrative with these parts in order: (1) overall conclusion in two sentences; (2) key findings with figures; (3) how the readings relate to or contradict each other; (4) change over time, trend and hotspots if present; (5) confidence and limitations; (6) prioritised recommended actions and the specific follow-up measurements or field checks. Separate paragraphs with a blank line (two newline characters) and use no markdown symbols. Connect the readings (or a deeper single paragraph if there's only one reading). If water_level_estimate is present in the input, explicitly weave it in — state the estimated change in metres, note it's a PROXY MEASUREMENT (not direct altimetry), and connect it to the other readings where relevant (e.g. does a water level drop align with a water extent decrease?)."
                     }
                 },
                 "required": ["per_calculation", "synthesis"]
@@ -220,7 +246,7 @@ Call the generate_report tool with your analysis.{language_instruction}"""
         client = anthropic.Anthropic(api_key=api_key)
         response = client.messages.create(
             model=ANTHROPIC_MODEL,
-            max_tokens=4000,
+            max_tokens=8000,
             system=SYSTEM_PROMPT,
             messages=[{"role": "user", "content": user_prompt}],
             tools=[report_tool],

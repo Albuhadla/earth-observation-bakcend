@@ -54,14 +54,13 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'change-me-in-production')
 # legacy "postgres://" scheme — SQLAlchemy 1.4+ rejects that outright with
 # a "could not determine dialect" crash, requiring "postgresql://"
 # instead. Same connection, just the modern scheme name.
-_db_url = os.getenv('DATABASE_URL', 'sqlite:///razaza.db')
-if _db_url.startswith('postgres://'):
-    _db_url = _db_url.replace('postgres://', 'postgresql://', 1)
-# Always use the psycopg2 driver we install (requirements.txt). A URL written
-# as postgresql+psycopg:// (psycopg v3) would crash every worker on boot.
-for _bad in ('postgresql+psycopg://', 'postgresql+psycopg3://'):
-    if _db_url.startswith(_bad):
-        _db_url = _db_url.replace(_bad, 'postgresql+psycopg2://', 1)
+_db_url = (os.getenv('DATABASE_URL') or 'sqlite:///razaza.db').strip().strip('"').strip("'").strip()
+if _db_url.lower().startswith('database_url='):   # value pasted with its own name
+    _db_url = _db_url.split('=', 1)[1].strip().strip('"').strip("'")
+import re as _re
+# Normalise whatever scheme was pasted to the driver we install (psycopg2):
+# postgres://, postgresql://, postgresql+psycopg://, postgresql+psycopg3://, etc.
+_db_url = _re.sub(r'^(postgres|postgresql)(\+[a-z0-9_]+)?://', 'postgresql+psycopg2://', _db_url, flags=_re.I)
 app.config['SQLALCHEMY_DATABASE_URI'] = _db_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 # Connection pool tuning — matters once on PostgreSQL with real concurrent

@@ -195,89 +195,81 @@ def generate_ai_report(readings, location, change_map, trend, water_level=None, 
         payload = _build_payload(readings, location, change_map, trend, water_level)
 
         language_instruction = (
-            "\n\nWrite your entire response — every description and the synthesis — in "
-            "Modern Standard Arabic. Keep index names, technical abbreviations (e.g. NDVI, "
-            "NDTI, NDBI), units, and numeric values exactly as given, un-translated, since "
-            "these are standard scientific notation even in Arabic-language reports."
+            "\n\nWrite your entire response in Modern Standard Arabic. Keep index names, "
+            "technical abbreviations (e.g. NDVI, NDTI, NDBI), units, and numeric values exactly "
+            "as given, un-translated, since these are standard scientific notation even in "
+            "Arabic-language reports."
             if language == 'ar' else ""
         )
+        data_block = f"Here is the structured data for this session:\n\n{json.dumps(payload, indent=2)}\n\n"
+        client = anthropic.Anthropic(api_key=api_key, timeout=150.0, max_retries=1)
 
-        user_prompt = f"""Here is the structured data for this session:
-
-{json.dumps(payload, indent=2)}
-
-Call the generate_report tool with your analysis.{language_instruction}"""
-
-        # Tool use (structured output) instead of asking Claude to format
-        # JSON in a plain text reply — this is the actual, reliable fix.
-        # Text-based JSON formatting depends on the model following
-        # prompt instructions exactly every single time, which is what
-        # was failing intermittently. Tool use enforces the schema at
-        # the API level, so the response is guaranteed to already be a
-        # correctly-shaped dict — no text parsing, no preamble risk,
-        # no markdown-fence guessing.
-        report_tool = {
-            "name": "generate_report",
-            "description": "Submit the per-calculation descriptions and holistic synthesis for this Earth observation report.",
-            "input_schema": {
-                "type": "object",
-                "properties": {
-                    "per_calculation": {
-                        "type": "array",
-                        "description": "One entry per reading in the input data.",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "index": {"type": "string", "description": "The index name, exactly as given in the input."},
-                                "description": {"type": "string", "description": "A detailed paragraph of 5-8 sentences: the headline finding with its actual mean, range and std; what that spread means spatially; the start-to-end change or trend if present; image count and period; the confidence level and what it means for how far to trust it; and one specific practical implication."}
-                            },
-                            "required": ["index", "description"]
-                        }
-                    },
-                    "synthesis": {
-                        "type": "string",
-                        "description": "A 5-7 paragraph professional narrative with these parts in order: (1) overall conclusion in two sentences; (2) key findings with figures; (3) how the readings relate to or contradict each other; (4) change over time, trend and hotspots if present; (5) confidence and limitations; (6) prioritised recommended actions and the specific follow-up measurements or field checks. Separate paragraphs with a blank line (two newline characters) and use no markdown symbols. Connect the readings (or a deeper single paragraph if there's only one reading). If water_level_estimate is present in the input, explicitly weave it in — state the estimated change in metres, note it's a PROXY MEASUREMENT (not direct altimetry), and connect it to the other readings where relevant (e.g. does a water level drop align with a water extent decrease?)."
-                    }
-                },
-                "required": ["per_calculation", "synthesis"]
-            }
+        # SPEED: the per-reading descriptions and the overall synthesis are
+        # independent writing jobs, so they run IN PARALLEL as separate small
+        # requests instead of one very long sequential generation. A long
+        # session (or Arabic, which needs more tokens per sentence) used to
+        # take minutes in one request; this takes roughly as long as the
+        # slowest single piece.
+        desc_tool = {
+            "name": "submit_description",
+            "description": "Submit the description for ONE reading.",
+            "input_schema": {"type": "object", "properties": {
+                "description": {"type": "string", "description": "A detailed paragraph of 5-8 sentences: the headline finding with its actual mean, range and std; what that spread means spatially; the start-to-end change or trend if present; image count and period; the confidence level and what it means for how far to trust it; and one specific practical implication. Plain prose, no markdown."}
+            }, "required": ["description"]}
+        }
+        synth_tool = {
+            "name": "submit_synthesis",
+            "description": "Submit the holistic synthesis across all readings.",
+            "input_schema": {"type": "object", "properties": {
+                "synthesis": {"type": "string", "description": "A 5-7 paragraph professional narrative with these parts in order: (1) overall conclusion in two sentences; (2) key findings with figures; (3) how the readings relate to or contradict each other; (4) change over time, trend and hotspots if present; (5) confidence and limitations; (6) prioritised recommended actions and the specific follow-up measurements or field checks. Separate paragraphs with a blank line (two newline characters) and use no markdown symbols. If water_level_estimate is present in the input, explicitly weave it in — state the estimated change in metres, note it is a PROXY MEASUREMENT (not direct altimetry), and connect it to the other readings where relevant."}
+            }, "required": ["synthesis"]}
         }
 
-        client = anthropic.Anthropic(api_key=api_key)
-        response = client.messages.create(
-            model=ANTHROPIC_MODEL,
-            max_tokens=8000,
-            system=SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_prompt}],
-            tools=[report_tool],
-            tool_choice={"type": "tool", "name": "generate_report"}
-        )
+        def _call(tool, instruction, max_tokens):
+            resp = client.messages.create(
+                model=ANTHROPIC_MODEL, max_tokens=max_tokens, system=SYSTEM_PROMPT,
+                messages=[{"role": "user", "content": data_block + instruction + language_instruction}],
+                tools=[tool], tool_choice={"type": "tool", "name": tool["name"]}
+            )
+            blk = next((b for b in resp.content if getattr(b, 'type', None) == 'tool_use'), None)
+            if blk is None:
+                raise RuntimeError('AI did not return structured output')
+            return blk.input
 
-        tool_use_block = next((b for b in response.content if getattr(b, 'type', None) == 'tool_use'), None)
-        if tool_use_block is None:
-            # Fallback: in case a future model variant still replies in
-            # plain text despite tool_choice, try to salvage it from the
-            # raw text rather than failing outright.
-            raw_text = "".join(getattr(b, 'text', '') for b in response.content).strip()
-            parsed = _parse_ai_json(raw_text)
-            if parsed is None:
-                snippet = raw_text[:300].replace('\n', ' ')
-                logger.error(f'AI report: no tool_use block and text fallback failed. Raw response started with: {snippet}')
-                return {'error': f'AI did not return structured output. Raw output started with: "{snippet}..." — please try again.'}
-        else:
-            parsed = tool_use_block.input  # already a parsed dict — no JSON string parsing needed
+        from concurrent.futures import ThreadPoolExecutor
+        reading_names = [p['index'] for p in payload['readings']]
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            synth_future = pool.submit(
+                _call, synth_tool,
+                "Call submit_synthesis with the holistic synthesis across ALL readings.", 3500)
+            desc_futures = [
+                pool.submit(
+                    _call, desc_tool,
+                    f"Call submit_description with the description for ONLY this reading: \"{nm}\". "
+                    f"Use that reading's own figures; you may refer briefly to the others for comparison.", 1500)
+                for nm in reading_names
+            ]
+            per_calc, failed = [], 0
+            for nm, fut in zip(reading_names, desc_futures):
+                try:
+                    per_calc.append({'index': nm, 'description': fut.result().get('description', '')})
+                except Exception as e:
+                    failed += 1
+                    logger.error(f'AI description failed for {nm}: {e}')
+            try:
+                synthesis = synth_future.result().get('synthesis', '')
+            except Exception as e:
+                logger.error(f'AI synthesis failed: {e}')
+                synthesis = ''
 
-        if 'per_calculation' not in parsed or 'synthesis' not in parsed:
-            # If the response was cut off by the token limit, say so
-            # directly instead of a generic "missing fields" message —
-            # this is what actually happened here, since per_calculation
-            # is generated before synthesis and a long session (or a
-            # language like Arabic that needs more tokens per sentence)
-            # can hit the ceiling before synthesis is written.
-            if getattr(response, 'stop_reason', None) == 'max_tokens':
-                return {'error': f'AI response was cut off by the length limit before finishing (got: {list(parsed.keys())}) — please try again; if this keeps happening, it may help to run this with fewer readings in the session at once.'}
-            return {'error': f'AI response was missing expected fields — got keys: {list(parsed.keys())}. Please try again.'}
-        return parsed
+        if not synthesis and not per_calc:
+            return {'error': 'AI request failed — please try again in a moment.'}
+        if not synthesis:
+            return {'error': 'AI could not finish the overall synthesis — please try again.'}
+        result = {'per_calculation': per_calc, 'synthesis': synthesis}
+        if failed:
+            result['warning'] = f'{failed} reading description(s) could not be generated.'
+        return result
 
     except Exception as e:
         logger.error(f'AI report generation failed: {e}')

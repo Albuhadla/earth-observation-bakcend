@@ -397,3 +397,65 @@ def analyze_terrain_pattern(thumb_url, index_v, index_label):
     except Exception as e:
         logger.warning(f'Terrain pattern analysis failed (non-fatal): {e}')
         return None
+
+
+PRESTUDY_SYSTEM_PROMPT = """You are an urban-planning and real-estate site analyst writing the summary section \
+of an "Area Pre-Study" for a property developer. You are given structured JSON from OpenStreetMap: \
+nearest distances and counts of roads, transit, shopping, education, health, community facilities, \
+building counts, and scores out of 100.
+
+STRICT RULES:
+1. Use ONLY facts, names and numbers present in the JSON. Never invent a place, price, zoning rule, \
+population figure, project, or plan.
+2. Distances are straight-line from the centre of the drawn region, not drive time — say "about X m away".
+3. OpenStreetMap is volunteer-edited: a missing feature may be unmapped rather than absent. When a category \
+shows nothing, say "none found in the map data", never "there is none".
+4. Be specific and practical: quote the figures, name the nearest facilities when names are given, state what \
+the pattern means for a developer (for example the likely type of project the surroundings support, what \
+would be a selling point, what would be a weakness).
+5. End with the checks the developer must still do that this data cannot answer (zoning and permitted use, \
+ownership/title, utilities, soil/geotechnical survey, market prices and absorption).
+6. Plain professional prose, no markdown symbols, no bullet characters. Separate paragraphs with a blank line."""
+
+
+def generate_prestudy_summary(result, location=None, language='en'):
+    """Returns {'summary': str} or {'error': str}. Never raises."""
+    if not ANTHROPIC_AVAILABLE:
+        return {'error': 'AI module not installed on the server.'}
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        return {'error': 'AI feature not configured on the server (missing API key).'}
+    try:
+        slim = {
+            'location': location,
+            'overall_score': result.get('overall_score'), 'verdict': result.get('verdict'),
+            'area_context': result.get('area_context'),
+            'search_radius_m': result.get('radius_m'),
+            'roads': result.get('roads'), 'buildings': result.get('buildings'),
+            'groups': [{
+                'group': g.get('label'), 'score': g.get('score'),
+                'items': [{k: i.get(k) for k in ('label', 'nearest_m', 'nearest_name', 'count_1km', 'count_3km', 'count_5km', 'count_within', 'score')} for i in g.get('items', [])]
+            } for g in result.get('groups', [])],
+            'warnings': result.get('warnings'),
+        }
+        lang = ("\n\nWrite the entire summary in Modern Standard Arabic. Keep facility names, numbers and "
+                "technical abbreviations exactly as given." if language == 'ar' else "")
+        tool = {
+            "name": "submit_summary",
+            "description": "Submit the Area Pre-Study summary.",
+            "input_schema": {"type": "object", "properties": {
+                "summary": {"type": "string", "description": "4-6 paragraphs: (1) overall conclusion in two sentences; (2) access and transport with figures; (3) shopping, education, health and community services with figures; (4) how built-up the area is and what it suggests; (5) strengths and weaknesses for a developer and the kind of project the surroundings support; (6) what this data cannot tell them and the checks still needed. Paragraphs separated by a blank line, no markdown."}
+            }, "required": ["summary"]}
+        }
+        client = anthropic.Anthropic(api_key=api_key, timeout=120.0, max_retries=1)
+        resp = client.messages.create(
+            model=ANTHROPIC_MODEL, max_tokens=3000, system=PRESTUDY_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": f"Here is the area data:\n\n{json.dumps(slim, ensure_ascii=False, indent=1)}\n\nCall submit_summary.{lang}"}],
+            tools=[tool], tool_choice={"type": "tool", "name": "submit_summary"})
+        blk = next((b for b in resp.content if getattr(b, 'type', None) == 'tool_use'), None)
+        if blk is None or not blk.input.get('summary'):
+            return {'error': 'AI did not return a summary — please try again.'}
+        return {'summary': blk.input['summary']}
+    except Exception as e:
+        logger.error(f'Pre-study summary failed: {e}')
+        return {'error': f'AI request failed: {e}'}

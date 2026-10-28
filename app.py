@@ -737,6 +737,50 @@ def analysis_timeseries(user):
     return jsonify(result)
 
 
+@app.route('/api/prestudy', methods=['POST'])
+@token_required
+@rate_limit('30 per hour')
+def area_prestudy(user):
+    """Area Pre-Study — roads, transit, malls, services, building density around a region (OpenStreetMap)."""
+    if not user.has_access():
+        return jsonify({'error': 'Your trial or subscription has ended. Please subscribe to continue.', 'code': 'SUBSCRIPTION_REQUIRED'}), 402
+    if user.plan not in ('pro', 'enterprise'):
+        return jsonify({'error': 'The Area Pre-Study requires the Pro or Enterprise plan.', 'code': 'PRO_REQUIRED'}), 402
+    d = request.get_json() or {}
+    coords = d.get('roi')
+    try:
+        import prestudy
+    except Exception as e:
+        return jsonify({'error': f'Pre-study module failed to load: {e}'}), 500
+    result = prestudy.run_prestudy(coords)
+    if 'error' in result:
+        return jsonify(result), 503 if 'unavailable' in result['error'] else 400
+    return jsonify(result)
+
+
+@app.route('/api/ai/prestudy', methods=['POST'])
+@token_required
+@rate_limit('20 per hour')
+def ai_prestudy(user):
+    """Plain-language developer summary of an Area Pre-Study result."""
+    if not user.has_access():
+        return jsonify({'error': 'Your trial or subscription has ended. Please subscribe to continue.', 'code': 'SUBSCRIPTION_REQUIRED'}), 402
+    if user.plan not in ('pro', 'enterprise'):
+        return jsonify({'error': 'AI summaries require the Pro or Enterprise plan.', 'code': 'PRO_REQUIRED'}), 402
+    d = request.get_json() or {}
+    result = d.get('result')
+    if not result or not result.get('groups'):
+        return jsonify({'error': 'Run the Area Pre-Study first.'}), 400
+    try:
+        import ai_engine
+    except Exception as e:
+        return jsonify({'error': f'AI module failed to load: {e}'}), 500
+    out = ai_engine.generate_prestudy_summary(result, d.get('location'), d.get('language', 'en'))
+    if 'error' in out:
+        return jsonify(out), 422
+    return jsonify(out)
+
+
 @app.route('/api/analysis/history', methods=['GET'])
 @token_required
 def analysis_history(user):
